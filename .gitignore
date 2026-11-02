@@ -1,0 +1,16 @@
+node_modules/
+dist/
+main.js
+*.log
+.DS_Store
+/target/
+server/target/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/data/
+.env
+e2e-out/
+e2e-out/
+deploy/local.env
+!e2e/fake-livesync/main.js

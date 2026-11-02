@@ -1,0 +1,37 @@
+# Docker-Compose- bzw. Portainer-Stack „tandem“.
+# Image vorher bauen (siehe deploy/README.md), dann diesen Stack anlegen.
+services:
+  tandem:
+    image: tandem-server:latest
+    pull_policy: never
+    container_name: tandem
+    restart: unless-stopped
+    # Für die Portainer-Konsole (Exec mit TTY/Eingabe)
+    tty: true
+    stdin_open: true
+    environment:
+      # Für Links aus `tandem-server admin setup <kennung>` (Admin-Oberfläche unter /admin/)
+      TANDEM_PUBLIC_URL: ${TANDEM_PUBLIC_URL:-https://tandem.example.com}
+      # TANDEM_ADMIN: "off"   # Admin-Oberfläche komplett abschalten
+    volumes:
+      - tandem-data:/data
+    # Nur lokal erreichbar; öffentlich ausschließlich über Nginx Proxy Manager (HTTPS).
+    ports:
+      - "127.0.0.1:8095:8080"
+    networks:
+      - default
+      - proxy
+    mem_limit: 512m
+    pids_limit: 64
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+volumes:
+  tandem-data:
+
+networks:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-website-stack_web}

@@ -1,0 +1,47 @@
+/* Tandem */
+.tandem-status { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.tandem-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
+.tandem-dot.tandem-online { background: var(--color-green); }
+.tandem-dot.tandem-connecting { background: var(--color-yellow); }
+.tandem-dot.tandem-unauthorized { background: var(--color-red); }
+.tandem-status-peers { display: inline-flex; margin-left: 4px; }
+.tandem-avatar {
+	display: inline-flex; align-items: center; justify-content: center;
+	width: 22px; height: 22px; border-radius: 50%;
+	background: var(--tandem-color, var(--interactive-accent)); color: #fff;
+	font-size: 10px; font-weight: 600; line-height: 1; margin-left: -4px;
+	border: 2px solid var(--background-primary);
+}
+.tandem-avatar.small { width: 16px; height: 16px; font-size: 8px; border-width: 1px; }
+.tandem-avatars { display: inline-flex; align-items: center; margin-right: 6px; padding-left: 4px; }
+.tandem-muted { color: var(--text-muted); }
+.tandem-warning { padding: 8px 12px; margin-bottom: 12px; border-radius: 6px; background: rgba(var(--color-red-rgb), 0.15); color: var(--text-normal); }
+
+/* Remote-Cursor: Namensschild immer sichtbar (wie Google Docs), dezent */
+.cm-ySelectionCaret { position: relative; border-left: 2px solid; margin-left: -1px; margin-right: -1px; }
+.cm-ySelectionInfo {
+	opacity: 0.95 !important; transition: none !important;
+	top: -1.25em !important; left: -2px !important;
+	font-size: 0.7em !important; padding: 1px 4px !important; border-radius: 3px 3px 3px 0;
+	font-family: var(--font-interface) !important; font-weight: 500; white-space: nowrap; pointer-events: none;
+}
+.is-mobile .cm-ySelectionInfo { font-size: 0.65em !important; }
+.cm-ySelection { mix-blend-mode: multiply; }
+.theme-dark .cm-ySelection { mix-blend-mode: screen; }
+
+/* Präsenz: „tippt gerade“ */
+@keyframes tandem-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.tandem-avatar.is-typing { box-shadow: 0 0 0 2px var(--tandem-color); animation: tandem-pulse 1s ease-in-out infinite; }
+.tandem-typing { color: var(--text-muted); font-style: italic; margin-left: 4px; }
+.tandem-status.is-following { color: var(--text-accent); }
+.tandem-status.is-following::before { content: "👁 "; }
+
+/* Versionsgeschichte */
+.tandem-history-list { max-height: 40vh; overflow-y: auto; }
+.tandem-history-preview { max-height: 30vh; overflow: auto; white-space: pre-wrap; font-size: var(--font-smaller); background: var(--background-secondary); padding: 8px; border-radius: 6px; }
+.tandem-history-preview:empty { display: none; }
+
+/* Einladungen */
+.tandem-invite-result { margin: 8px 0 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.tandem-invite-result:empty { display: none; }
+.tandem-code { font-size: 1.2em; font-weight: 700; letter-spacing: 0.05em; padding: 2px 8px; user-select: all; }
