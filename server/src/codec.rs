@@ -81,6 +81,12 @@ pub const CHANGES: u64 = 6;
 pub const CATCHUP: u64 = 7;
 pub const PING: u64 = 8;
 pub const PONG: u64 = 9;
+// Ende-zu-Ende-verschlüsselte Spaces (siehe docs/E2EE.md): der Server führt nur ein Log aus Chiffretext.
+pub const ESUB: u64 = 10;
+pub const ELOG: u64 = 11;
+pub const EUPD: u64 = 12;
+pub const EACK: u64 = 13;
+pub const ECOMPACT: u64 = 14;
 
 pub const STEP1: u64 = 0;
 pub const STEP2: u64 = 1;
@@ -94,6 +100,12 @@ pub enum Frame<'a> {
     Unsub { doc: &'a str },
     Catchup { space: &'a str, since: u64 },
     Ping,
+    /// Abo eines verschlüsselten Docs: alle Log-Zeilen nach `since` anfordern.
+    ESub { doc: &'a str, since: u64 },
+    /// Verschlüsseltes Update anhängen.
+    EUpd { doc: &'a str, data: &'a [u8] },
+    /// Log bis einschließlich Zeile `upto` durch einen verschlüsselten Gesamtstand ersetzen.
+    ECompact { doc: &'a str, upto: u64, data: &'a [u8] },
 }
 
 /// Nur Frames, die ein Client senden darf.
@@ -113,6 +125,9 @@ pub fn decode_client(buf: &[u8]) -> Result<Frame<'_>, DecodeError> {
         UNSUB => Frame::Unsub { doc: r.string()? },
         CATCHUP => Frame::Catchup { space: r.string()?, since: r.var_uint()? },
         PING => Frame::Ping,
+        ESUB => Frame::ESub { doc: r.string()?, since: r.var_uint()? },
+        EUPD => Frame::EUpd { doc: r.string()?, data: r.bytes()? },
+        ECOMPACT => Frame::ECompact { doc: r.string()?, upto: r.var_uint()?, data: r.bytes()? },
         _ => return Err(DecodeError),
     };
     Ok(f)
@@ -140,6 +155,22 @@ pub fn changes(space: &str, seq: u64, docs: &[&str]) -> Vec<u8> {
 }
 pub fn pong() -> Vec<u8> {
     Writer::new().var_uint(PONG).finish()
+}
+/// Log eines verschlüsselten Docs: `total` = Zahl der gespeicherten Zeilen (Hinweis fürs Verdichten),
+/// danach n × (Zeilen-ID, Chiffretext).
+pub fn elog<'a>(doc: &str, total: u64, rows: impl ExactSizeIterator<Item = (u64, &'a [u8])>) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.var_uint(ELOG).string(doc).var_uint(total).var_uint(rows.len() as u64);
+    for (id, data) in rows {
+        w.var_uint(id).bytes(data);
+    }
+    w.finish()
+}
+pub fn eupd(doc: &str, id: u64, data: &[u8]) -> Vec<u8> {
+    Writer::new().var_uint(EUPD).string(doc).var_uint(id).bytes(data).finish()
+}
+pub fn eack(doc: &str, id: u64) -> Vec<u8> {
+    Writer::new().var_uint(EACK).string(doc).var_uint(id).finish()
 }
 
 /// Ein Eintrag eines Awareness-Updates (y-protocols): clientID, clock, JSON-Zustand ("null" = entfernt).
@@ -231,6 +262,13 @@ mod tests {
         assert_eq!(error(403, "space/abc", "kein Zugriff"), get("error"));
         assert_eq!(changes("space", 70000, &["space/a", "space/b"]), get("changes"));
         assert_eq!(pong(), get("pong"));
+        // Verschlüsselte Spaces
+        assert_eq!(decode_client(&get("esub")).unwrap(), Frame::ESub { doc: "space/abc", since: 300 });
+        assert_eq!(decode_client(&get("eupd-client")).unwrap(), Frame::EUpd { doc: "space/abc", data: &[9, 8, 7] });
+        assert_eq!(decode_client(&get("ecompact")).unwrap(), Frame::ECompact { doc: "space/abc", upto: 300, data: &[5, 6] });
+        assert_eq!(eupd("space/abc", 300, &[9, 8, 7]), get("eupd-server"));
+        assert_eq!(eack("space/abc", 300), get("eack"));
+        assert_eq!(elog("space/abc", 3, [(7u64, &[1u8, 2][..]), (300, &[3][..])].into_iter()), get("elog"));
         let w = get("welcome");
         let mut r = Reader::new(&w);
         assert_eq!(r.var_uint().unwrap(), WELCOME);

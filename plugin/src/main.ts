@@ -7,11 +7,23 @@ import { SpaceSync } from "./sync/SpaceSync";
 import { Presence, initials, type Peer } from "./presence/Presence";
 import { DEFAULT_SETTINGS, TandemSettingTab, type TandemSettings } from "./settings";
 import { InkBridge } from "./ink/InkBridge";
-import { HistoryModal, listSnapshots } from "./ui/History";
+import { HistoryModal, listSnapshots, loadSnapshot } from "./ui/History";
 import { backupVault, canBackup } from "./ui/Backup";
+import { createParams, SpaceKey, b64, unb64, unlock } from "./crypto/e2ee";
+import type { E2eeParams, WelcomeSpace } from "./net/protocol";
+import { PassphraseModal } from "./ui/Passphrase";
+import { checkTransport } from "./net/transport";
+import { installRelease, latestRelease, newer, reloadPlugin, type Release } from "./ui/Update";
 
 const LS_TOKEN = "tandem-token";
 const LS_DEVICE = "tandem-device";
+/** Pro Space: zuletzt bekannte E2EE-Einstellung ("plain" | "pending" | Parameter) – für den Start ohne Netz. */
+const LS_E2EE_MODE = "tandem-e2ee-mode:";
+/** Pro Space: abgeleiteter Schlüssel `{check, raw}` – nur auf diesem Gerät. */
+const LS_E2EE_KEY = "tandem-e2ee-key:";
+const LS_UPDATE_CHECK = "tandem-update-check";
+
+export type E2eeMode = "plain" | "pending" | E2eeParams;
 
 export default class TandemPlugin extends Plugin {
 	settings: TandemSettings = { ...DEFAULT_SETTINGS };
@@ -25,6 +37,16 @@ export default class TandemPlugin extends Plugin {
 	private stopFollow: (() => void) | null = null;
 	private hiddenTimer: number | null = null;
 	api: Record<string, unknown> = {};
+	/** Schlüssel des aktuellen Space (verschlüsselt) bzw. null. */
+	key: SpaceKey | null = null;
+	/** Aktueller Modus des Space (nach dem Start). */
+	e2eeMode: E2eeMode = "plain";
+	private passModal: PassphraseModal | null = null;
+	/** Ersetzt „online“ in der Statusleiste, solange der Vault gesperrt ist / auf die Passphrase wartet. */
+	private statusNote: string | null = null;
+	private decryptWarned = false;
+	/** Neuere Version auf GitHub (nach der letzten Prüfung), sonst null. */
+	update: Release | null = null;
 
 	get token(): string {
 		return (this.app.loadLocalStorage(LS_TOKEN) as string | null) ?? "";
@@ -57,8 +79,13 @@ export default class TandemPlugin extends Plugin {
 			peers: () => this.presence?.peers ?? [],
 			status: () => this.conn?.status ?? "offline",
 			history: (docId: string) => listSnapshots(this.http(), this.settings.space, docId),
+			snapshotText: async (docId: string, ts: number) => (await loadSnapshot(this.http(), this.settings.space, docId, ts, this.key)).getText("content").toString(),
 			invite: (user: string, name: string, role?: "write" | "read" | "owner", hours?: number) => this.createInvite(user, name, role, hours),
 			members: () => this.members(),
+			e2ee: () => ({ mode: this.e2eeMode, unlocked: !!this.key }),
+			e2eeSetup: (passphrase: string, iter?: number) => this.setupE2ee(passphrase, iter),
+			e2eeUnlock: (passphrase: string) => this.unlockWith(passphrase),
+			e2eeForget: () => this.forgetKey(),
 		};
 
 		this.addCommand({ id: "connect", name: "Verbinden / neu verbinden", callback: () => void this.restart() });
@@ -104,7 +131,13 @@ export default class TandemPlugin extends Plugin {
 				this.conn.kick();
 			}
 		});
-		this.app.workspace.onLayoutReady(() => void this.startup());
+		this.addCommand({ id: "check-update", name: "Nach Updates suchen", callback: () => void this.checkUpdate(false) });
+		this.app.workspace.onLayoutReady(() => {
+			void this.startup();
+			// Höchstens einmal am Tag still nachsehen; gemeldet wird nur, wenn es etwas Neues gibt.
+			const last = Number(this.app.loadLocalStorage(LS_UPDATE_CHECK) ?? 0);
+			if (Date.now() - last > 24 * 3600 * 1000) window.setTimeout(() => void this.checkUpdate(true), 15000);
+		});
 	}
 
 	async onunload() {
@@ -129,13 +162,73 @@ export default class TandemPlugin extends Plugin {
 			this.renderStatus("offline", "LiveSync aktiv");
 			return;
 		}
+		const transport = checkTransport(this.settings.serverUrl);
+		if (!transport.ok) {
+			new Notice(`Tandem: ${transport.reason}`, 15000);
+			this.renderStatus("offline", "unsichere Adresse");
+			return;
+		}
 		const url = this.settings.serverUrl.replace(/\/+$/, "").replace(/^http/, "ws") + "/ws";
 		const conn = new Connection({ url, token: this.token, device: this.device });
 		this.conn = conn;
+		conn.onStatus((s) => this.renderStatus(s));
+		// Erst die Anmeldung abwarten: WELCOME sagt, ob der Space Ende-zu-Ende-verschlüsselt ist.
+		conn.start();
+		await new Promise<void>((ok) => {
+			if (conn.status === "online") return ok();
+			const t = window.setTimeout(done, 6000);
+			const off = conn.onStatus((s) => {
+				if (s === "online" || s === "unauthorized") done();
+			});
+			function done() {
+				window.clearTimeout(t);
+				off();
+				ok();
+			}
+		});
+		if (this.conn !== conn) return; // inzwischen neu gestartet
+		const space = this.settings.space;
+		const mode = this.currentMode(conn.welcome?.spaces.find((s) => s.id === space));
+		this.e2eeMode = mode;
+		this.key = null;
+		this.statusNote = null;
+		// Modus hat sich auf dem Server geändert (z. B. Verschlüsselung eingerichtet) → neu starten.
+		conn.onStatus((s) => {
+			if (s !== "online" || this.conn !== conn) return;
+			const now = this.currentMode(conn.welcome?.spaces.find((x) => x.id === space));
+			if (modeKey(now) !== modeKey(mode)) void this.restart();
+		});
+		if (mode === "pending") {
+			// Verbindung bleibt offen: Sobald die Passphrase festgelegt ist, trennt der Server alle → Neustart.
+			const owner = conn.welcome?.spaces.find((s) => s.id === space)?.role === "owner";
+			this.statusNote = owner ? "Passphrase festlegen" : "wartet auf Verschlüsselung";
+			this.renderStatus(conn.status);
+			if (owner) this.askPassphrase("set");
+			else new Notice("Tandem: Dieser Vault wird Ende-zu-Ende-verschlüsselt. Die Besitzerin/der Besitzer muss erst die Passphrase festlegen.", 12000);
+			return;
+		}
+		if (mode !== "plain") {
+			this.key = await this.cachedKey(mode);
+			if (this.conn !== conn) return;
+			if (!this.key) {
+				this.statusNote = "gesperrt – Passphrase eingeben";
+				this.renderStatus(conn.status);
+				this.askPassphrase("unlock");
+				return;
+			}
+		}
 		// @ts-expect-error – interne API: eindeutige Vault-ID
 		const vaultId: string = this.app.appId ?? this.app.vault.getName();
 		this.store = new LocalStore(`tandem-${vaultId}-${this.settings.space}`);
 		await this.store.open();
+		// Lokaler Stand passt nur zum selben Modus (Klartext bzw. derselbe Schlüssel) – sonst neu aufbauen.
+		const marker = mode === "plain" ? "plain" : `e2ee:${mode.check}`;
+		const prev = await this.store.getMeta<string>("mode");
+		if (prev !== undefined && prev !== marker) {
+			console.log("[tandem] Verschlüsselungsmodus geändert – lokaler Zwischenspeicher wird neu aufgebaut");
+			await this.store.clear();
+		}
+		await this.store.setMeta("mode", marker);
 		// Vor dem allerersten Abgleich dieses Vaults mit diesem Space: Sicherung (Desktop)
 		if (!(await this.store.getMeta<number>("first-sync-done"))) {
 			if (this.settings.backupBeforeFirstSync && canBackup(this.app)) {
@@ -152,9 +245,9 @@ export default class TandemPlugin extends Plugin {
 			}
 			await this.store.setMeta("first-sync-done", Date.now());
 		}
-		conn.onStatus((s) => this.renderStatus(s));
 		conn.onError((code, doc, msg) => {
 			if (code === 401) new Notice("Tandem: Anmeldung abgelehnt – bitte neu einladen lassen (Einstellungen).");
+			else if (code === 426 && this.conn === conn) void this.restart(); // Space wurde verschlüsselt
 			else console.warn("[tandem] Serverfehler", code, doc, msg);
 		});
 		const user = () => conn.welcome?.user ?? { id: "local", name: this.settings.displayName || "Ich", color: "#888888" };
@@ -177,9 +270,15 @@ export default class TandemPlugin extends Plugin {
 			user,
 			http: () => this.http(),
 			log: (m) => console.log("[tandem]", m),
+			key: this.key,
 		});
 		this.sync = sync;
-		conn.start();
+		sync.docs.onDecryptError = (docId, e) => {
+			if (this.decryptWarned) return;
+			this.decryptWarned = true;
+			new Notice(`Tandem: Daten lassen sich nicht entschlüsseln (${e.message}). Wurde die Passphrase geändert? Einstellungen → Verschlüsselung → „Schlüssel vergessen“ und neu eingeben.`, 20000);
+			console.error("[tandem] Entschlüsseln fehlgeschlagen", docId, e);
+		};
 		await sync.start();
 		this.presence = new Presence(this.app, sync.indexSession.awareness!, user, this.device);
 		this.presence.onPeers(() => {
@@ -203,12 +302,114 @@ export default class TandemPlugin extends Plugin {
 		return { base: this.settings.serverUrl.replace(/\/+$/, ""), token: this.token };
 	}
 
+	// ── Updates ──────────────────────────────────────────────────────────
+
+	/** Neueste Version auf GitHub abfragen. `quiet`: Fehler und „aktuell“ nicht melden. */
+	async checkUpdate(quiet: boolean): Promise<Release | null> {
+		try {
+			const rel = await latestRelease();
+			this.app.saveLocalStorage(LS_UPDATE_CHECK, String(Date.now()));
+			this.update = newer(rel.version, this.manifest.version) ? rel : null;
+			if (this.update) new Notice(`Tandem ${rel.version} ist verfügbar (installiert: ${this.manifest.version}). Einstellungen → Tandem → „Aktualisieren“.`, 12000);
+			else if (!quiet) new Notice(`Tandem ${this.manifest.version} ist aktuell.`);
+			return this.update;
+		} catch (e) {
+			if (!quiet) new Notice(`Tandem: Update-Prüfung fehlgeschlagen – ${(e as Error).message}`);
+			return null;
+		}
+	}
+
+	/** Update installieren und das Plugin neu laden (Verbindung wird kurz getrennt). */
+	async installUpdate(rel: Release): Promise<void> {
+		await installRelease(this.app, this.manifest, rel);
+		new Notice(`Tandem: ${rel.version} installiert – lade neu …`);
+		await reloadPlugin(this.app, this.manifest.id);
+	}
+
+	// ── Ende-zu-Ende-Verschlüsselung ─────────────────────────────────────
+
+	/** Modus aus WELCOME (online) bzw. zuletzt bekannter Modus (offline). Merkt sich den Online-Wert. */
+	private currentMode(info: WelcomeSpace | undefined): E2eeMode {
+		const k = LS_E2EE_MODE + this.settings.space;
+		if (info) {
+			const mode: E2eeMode = info.e2ee ?? "plain";
+			this.app.saveLocalStorage(k, JSON.stringify(mode));
+			return mode;
+		}
+		try {
+			return (JSON.parse((this.app.loadLocalStorage(k) as string | null) ?? '"plain"') as E2eeMode) ?? "plain";
+		} catch {
+			return "plain";
+		}
+	}
+
+	private async cachedKey(params: E2eeParams): Promise<SpaceKey | null> {
+		try {
+			const c = JSON.parse((this.app.loadLocalStorage(LS_E2EE_KEY + this.settings.space) as string | null) ?? "null") as { check: string; raw: string } | null;
+			if (!c || c.check !== params.check) return null;
+			return await SpaceKey.fromRaw(this.settings.space, unb64(c.raw));
+		} catch {
+			return null;
+		}
+	}
+
+	private storeKey(params: E2eeParams, key: SpaceKey) {
+		this.app.saveLocalStorage(LS_E2EE_KEY + this.settings.space, JSON.stringify({ check: params.check, raw: b64(key.raw) }));
+	}
+
+	/** Passphrase prüfen, Schlüssel auf diesem Gerät merken und neu starten. */
+	async unlockWith(passphrase: string): Promise<void> {
+		const mode = this.e2eeMode;
+		if (mode === "plain" || mode === "pending") throw new Error("Dieser Vault ist nicht verschlüsselt");
+		const key = await unlock(this.settings.space, passphrase, mode);
+		if (!key) throw new Error("Passphrase stimmt nicht");
+		this.storeKey(mode, key);
+		this.decryptWarned = false;
+		await this.restart();
+	}
+
+	/** Verschlüsselung für den (leeren) Space einrichten – nur Besitzer. */
+	async setupE2ee(passphrase: string, iter?: number): Promise<void> {
+		const { params, key } = await createParams(this.settings.space, passphrase, iter);
+		const { base, token } = this.http();
+		const r = await requestUrl({
+			url: `${base}/api/e2ee/${encodeURIComponent(this.settings.space)}`,
+			method: "POST",
+			contentType: "application/json",
+			headers: { Authorization: `Bearer ${token}` },
+			body: JSON.stringify(params),
+			throw: false,
+		});
+		if (r.status !== 204) throw new Error(r.text || `HTTP ${r.status}`);
+		this.storeKey(params, key);
+		this.app.saveLocalStorage(LS_E2EE_MODE + this.settings.space, JSON.stringify(params));
+		await this.restart();
+	}
+
+	/** Schlüssel auf diesem Gerät löschen (beim nächsten Start wird nach der Passphrase gefragt). */
+	async forgetKey(): Promise<void> {
+		this.app.saveLocalStorage(LS_E2EE_KEY + this.settings.space, null);
+		await this.restart();
+	}
+
+	askPassphrase(kind: "set" | "unlock") {
+		this.passModal?.close();
+		this.passModal = new PassphraseModal(this.app, kind, this.settings.space, async (pass) => {
+			if (kind === "set") await this.setupE2ee(pass);
+			else await this.unlockWith(pass);
+		});
+		this.passModal.open();
+	}
+
 	async restart() {
 		await this.shutdown();
 		await this.startup();
 	}
 
 	async shutdown() {
+		this.passModal?.close();
+		this.passModal = null;
+		this.statusNote = null;
 		this.follow(null);
 		this.ink?.stop();
 		this.ink = null;
@@ -224,12 +425,14 @@ export default class TandemPlugin extends Plugin {
 	}
 
 	renderStatus(s: ConnStatus, note?: string) {
+		note ??= s === "online" ? (this.statusNote ?? undefined) : undefined;
 		const el = this.statusEl;
 		if (!el) return;
 		el.empty();
 		const label = { offline: "offline", connecting: "verbinde …", online: "online", unauthorized: "nicht angemeldet" }[s];
 		el.createSpan({ cls: `tandem-dot tandem-${s}` });
 		el.createSpan({ text: ` Tandem ${note ?? label}` });
+		if (this.key && s === "online" && !note) el.createSpan({ cls: "tandem-lock", text: " 🔒", attr: { "aria-label": "Ende-zu-Ende-verschlüsselt" } });
 		const peers = this.presence?.peers ?? [];
 		if (s === "online" && peers.length) {
 			const wrap = el.createSpan({ cls: "tandem-status-peers" });
@@ -373,6 +576,10 @@ export default class TandemPlugin extends Plugin {
 			return;
 		}
 	}
+}
+
+function modeKey(m: E2eeMode): string {
+	return typeof m === "string" ? m : `e2ee:${m.check}`;
 }
 
 class PeerModal extends SuggestModal<Peer> {

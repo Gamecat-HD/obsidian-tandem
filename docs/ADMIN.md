@@ -34,7 +34,13 @@ Alle Antworten sind JSON, Fehler haben die Form `{"error": "Meldung auf Deutsch"
 | Methode | Pfad | Body → Antwort |
 |---|---|---|
 | GET | `/admin/api/me` | → `{user:{id,name,color}, session, expires}` oder 401 |
-| POST | `/admin/api/login` | `{user, password, totp}` → wie `me` (setzt Cookie); 401 / 429 |
+| POST | `/admin/api/login` | Schritt 1: `{user, password}` → `{ticket, methods:["passkey"?,"totp"], passkey: null \| PublicKeyCredentialRequestOptions (base64url)}`; 401 / 429. **Noch keine Sitzung.** Das Ticket gilt 5 min für höchstens 5 Versuche |
+| POST | `/admin/api/login/totp` | Schritt 2: `{ticket, code}` → wie `me` (setzt Cookie); 401 (Code falsch/benutzt, Ticket abgelaufen) / 429 |
+| POST | `/admin/api/login/passkey` | Schritt 2: `{ticket, credential:{id, response:{clientDataJSON, authenticatorData, signature}}}` (base64url) → wie `me` (setzt Cookie); 401 / 429 |
+| GET | `/admin/api/passkeys` | → `[{id, name, created, lastUsed}]` |
+| POST | `/admin/api/passkeys/options` | → PublicKeyCredentialCreationOptions (base64url, Challenge 5 min an die Sitzung gebunden) |
+| POST | `/admin/api/passkeys` | `{name, credential:{response:{clientDataJSON, attestationObject}}}` → `{id, name}` |
+| DELETE | `/admin/api/passkeys/<id>` | → 204 |
 | POST | `/admin/api/logout` | → 204 |
 | POST | `/admin/api/setup/start` | `{code, password}` → `{user, secret, uri, qr}` (`qr` = SVG-Text, nur als `<img src="data:image/svg+xml;charset=utf-8,…">` einbinden) |
 | POST | `/admin/api/setup/check` | `{code}` → `{user, staged}` (Link vorab prüfen; 400 = ungültig/abgelaufen; `staged` = Schritt 1 schon erledigt, das Geheimnis bleibt beim erneuten `start` gleich) |
@@ -167,3 +173,12 @@ cd server && cargo build
 TANDEM_ADMIN_UI_DIR=$PWD/admin-ui ./target/debug/tandem-server --data /tmp/t serve   # UI-Dateien live von der Platte
 ```
 Tests: `cargo test` (TOTP-Vektoren aus RFC 6238, Passwörter, Diff, Index) und `TANDEM_SERVER=rust node e2e/run.mjs m12` (Admin-Änderungen in echten Obsidian-Instanzen).
+
+## Anmeldung: wie sie abgesichert ist
+
+- **Zwei Schritte:** Kennung + Passwort (Argon2id) ergeben nur ein Ticket. Eine Sitzung gibt es erst mit dem zweiten Faktor: dem 6-stelligen Code (TOTP) oder einem **Passkey** (WebAuthn, ES256/EdDSA/RS256, Nutzerprüfung per PIN/Biometrie Pflicht). Passkeys richtet man angemeldet unter „Konto“ ein. Der Code bleibt als Rückfallweg.
+- **Passkeys** sind an die Domain gebunden (`TANDEM_PUBLIC_URL` bzw. Host). Eine Phishing-Seite bekommt keine gültige Antwort. Der Signaturzähler erkennt kopierte Schlüssel. Ein neuer Einrichtungslink (`admin setup`) löscht alle Passkeys des Zugangs.
+- **Codes** gelten nur einmal, auch bei zwei gleichzeitigen Anmeldungen (bedingtes Speichern des Zeitschritts).
+- **Fehlversuche:** pro Konto ab 5 Fehlern Sperre ab 15 min, die sich je weitere 5 verdoppelt (max. 24 h). Pro IP höchstens 10 Fehlversuche in 15 min. Die IP stammt aus `CF-Connecting-IP`/`X-Real-IP`/`X-Forwarded-For`. Ist der Server an Cloudflare/dem Proxy vorbei direkt erreichbar, lässt sich die IP fälschen. Deshalb den Ursprungsserver per Firewall nur für den Proxy öffnen. Die Kontosperre gilt unabhängig davon.
+- **Sitzung:** Cookie `__Host-…; Secure; HttpOnly; SameSite=Strict`, 30 min Leerlauf, höchstens 12 h. Schreibende Anfragen brauchen den Header `X-Tandem-Admin: 1` und eine passende `Origin` (CSRF).
+- Geprüft durch `node e2e/run.mjs m15` (u. a. alle Routen ohne Sitzung, Replay, Phishing-Origin, Passkey ohne Passwort-Schritt).

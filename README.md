@@ -39,7 +39,9 @@ Self-hosted LiveSync synchronisiert Dateien über CouchDB. Das funktioniert, abe
 | 📱 **Mobil** | Android und iPad/iPhone. Trennt im Hintergrund, um Akku zu sparen |
 | 🕓 **Verlauf & Sicherungen** | Versionsgeschichte je Notiz, tägliche Server-Sicherung, Vault-Kopie vor dem ersten Abgleich |
 | 🔐 **Rechte** | Besitzer / Schreiben / Nur-Lesen, Einladungscodes, einzeln sperrbare Geräte |
-| 🛠️ **Admin-Oberfläche** | Vaults durchsuchen und bearbeiten, Personen, Geräte, Sicherungen, Statistik. Passwort + 2FA |
+| 🔒 **Ende-zu-Ende-verschlüsselt** (pro Vault) | Notizen, Dateinamen, Anhänge und Cursor verlassen die Geräte nur verschlüsselt, der Server sieht nur Chiffretext. [Details](docs/E2EE.md) |
+| 🛠️ **Admin-Oberfläche** | Vaults durchsuchen und bearbeiten, Personen, Geräte, Sicherungen, Statistik. Passwort + Code oder Passkey |
+| ⬆️ **Updates** | Knopf in den Einstellungen: lädt die neueste Version aus den GitHub-Releases (mit Prüfsummen) |
 
 ## Screenshots
 
@@ -138,4 +140,4 @@ Die E2E-Tests starten isolierte, headless Obsidian-Instanzen (eigenes Profil, We
 
 ## Status
 
-Tandem ist im täglichen Einsatz (mehrere Personen, Desktop und Tablet) und ersetzt dort LiveSync. Das Plugin ist noch nicht im offiziellen Community-Katalog. Ende-zu-Ende-Verschlüsselung ist (noch) nicht eingebaut. Der Server sieht die Inhalte, deshalb gehört er auf eigene Hardware.
+Tandem ist im täglichen Einsatz (mehrere Personen, Desktop und Tablet) und ersetzt dort LiveSync. Das Plugin ist noch nicht im offiziellen Community-Katalog. Ende-zu-Ende-Verschlüsselung gibt es pro Vault ([E2EE.md](docs/E2EE.md)). In Klartext-Vaults sieht der Server die Inhalte, deshalb gehört er auf eigene Hardware.

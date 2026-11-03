@@ -47,6 +47,7 @@ pub fn router(app: App) -> Router {
         .route("/api/status", get(status))
         .route("/api/invite", post(invite))
         .route("/api/members/{space}", get(members))
+        .route("/api/e2ee/{space}", post(e2ee_setup))
         .route("/api/blob/{space}/{hash}", get(blob_get).head(blob_head).put(blob_put))
         .route("/api/history/{space}/{doc}", get(history_list))
         .route("/api/history/{space}/{doc}/{ts}", get(history_get))
@@ -161,12 +162,16 @@ async fn handle_socket(socket: WebSocket, app: App) {
                 app.hub.send_to(id, codec::pong());
                 Ok(())
             }
+            Ok(Frame::ESub { doc, since }) => app.hub.on_esub(id, doc, since).map_err(|e| (doc.to_string(), e)),
+            Ok(Frame::EUpd { doc, data }) => app.hub.on_eupd(id, doc, data).map_err(|e| (doc.to_string(), e)),
+            Ok(Frame::ECompact { doc, upto, data }) => app.hub.on_ecompact(id, doc, upto, data).map_err(|e| (doc.to_string(), e)),
             Ok(Frame::Hello { .. }) => Ok(()),
             Err(_) => Err((String::new(), HubError::BadRequest("Frame ungültig"))),
         };
         if let Err((doc, e)) = res {
             let (code, msg) = match e {
                 HubError::Forbidden => (403, "kein Zugriff".to_string()),
+                HubError::E2ee => (426, "Space ist Ende-zu-Ende-verschlüsselt – Tandem-Plugin aktualisieren (ab 0.5)".to_string()),
                 HubError::BadRequest(m) => (400, m.to_string()),
                 HubError::Internal(m) => {
                     warn!(conn = id, doc, "interner Fehler: {m}");
@@ -287,6 +292,45 @@ async fn invite(State(app): State<App>, h: HeaderMap, Json(req): Json<InviteReq>
         }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
+}
+
+/// Öffentliche Schlüsselparameter eines verschlüsselten Space prüfen. Die Passphrase selbst und der
+/// Schlüssel verlassen nie das Gerät; `check` ist ein mit dem Schlüssel verschlüsselter Prüfwert.
+pub fn valid_e2ee_params(v: &serde_json::Value) -> Option<String> {
+    let o = v.as_object()?;
+    let b64 = |k: &str, max: usize| o.get(k)?.as_str().filter(|s| !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))).map(str::to_string);
+    if o.get("v")?.as_u64()? != 1 || o.get("kdf")?.as_str()? != "pbkdf2-sha256" {
+        return None;
+    }
+    let iter = o.get("iter")?.as_u64().filter(|i| (100_000..=10_000_000).contains(i))?;
+    let (salt, check) = (b64("salt", 64)?, b64("check", 256)?);
+    Some(serde_json::json!({ "v": 1, "kdf": "pbkdf2-sha256", "iter": iter, "salt": salt, "check": check }).to_string())
+}
+
+/// Ende-zu-Ende-Verschlüsselung für einen Space festlegen (nur Besitzer, nur solange der Space leer ist
+/// oder auf die Passphrase wartet). Danach verbinden sich alle Geräte neu und bekommen die Parameter.
+async fn e2ee_setup(State(app): State<App>, h: HeaderMap, Path(space): Path<String>, Json(params): Json<serde_json::Value>) -> Response {
+    let me = match require_role(&app, &h, &space, true) {
+        Ok(u) => u,
+        Err(c) => return c.into_response(),
+    };
+    let Some(params) = valid_e2ee_params(&params) else {
+        return (StatusCode::BAD_REQUEST, "Schlüsselparameter ungültig").into_response();
+    };
+    {
+        let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
+        if st.role(&space, &me.id).ok().flatten().as_deref() != Some("owner") {
+            return (StatusCode::FORBIDDEN, "Nur Besitzer des Space können die Verschlüsselung einrichten").into_response();
+        }
+        if let Err(e) = st.set_space_e2ee(&space, Some(&params)) {
+            return (StatusCode::CONFLICT, e.to_string()).into_response();
+        }
+        st.audit(&me.id, &client_ip(&h), "space.e2ee", &space);
+    }
+    app.hub.drop_space(&space);
+    let n = app.hub.kick_where(|k| k.spaces.contains_key(&space));
+    info!(by = me.id, space, kicked = n, "Ende-zu-Ende-Verschlüsselung eingerichtet");
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn members(State(app): State<App>, h: HeaderMap, Path(space): Path<String>) -> Response {

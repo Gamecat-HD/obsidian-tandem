@@ -37,7 +37,9 @@ impl Default for Config {
 }
 
 struct Room {
-    doc: Doc,
+    /// None bei Ende-zu-Ende-verschlüsselten Spaces: der Server kennt dort nur Chiffretext.
+    doc: Option<Doc>,
+    e2ee: bool,
     subs: HashSet<ConnId>,
     aw: HashMap<u64, (AwEntry, ConnId)>,
     idle_since: Option<Instant>,
@@ -77,6 +79,8 @@ pub struct Hub {
 #[derive(Debug)]
 pub enum HubError {
     Forbidden,
+    /// Space ist Ende-zu-Ende-verschlüsselt – Klartext-Zugriff (Yjs-Sync, Admin, Lese-API) nicht möglich.
+    E2ee,
     BadRequest(&'static str),
     Internal(String),
 }
@@ -131,6 +135,15 @@ impl Hub {
     }
 
     fn load_room(&self, name: &str) -> Result<Room, HubError> {
+        let (space, _) = codec::split_doc(name).ok_or(HubError::BadRequest("Doc-Name ungültig"))?;
+        {
+            let st = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            if st.space_e2ee(space).map_err(|e| HubError::Internal(e.to_string()))?.is_some() {
+                // Nur Verwaltung (Abonnenten, Awareness) – Inhalte bleiben in der Datenbank.
+                let rows = st.update_count(name).map_err(|e| HubError::Internal(e.to_string()))?;
+                return Ok(Room { doc: None, e2ee: true, subs: HashSet::new(), aw: HashMap::new(), idle_since: None, rows, changed: false, captured: Arc::default() });
+            }
+        }
         let rows = self.store.lock().unwrap_or_else(|e| e.into_inner()).load_updates(name).map_err(|e| HubError::Internal(e.to_string()))?;
         let doc = Doc::new();
         {
@@ -158,7 +171,7 @@ impl Hub {
         })
         .map_err(|e| HubError::Internal(e.to_string()))?;
         debug!(doc = name, rows = rows.len(), "Doc geladen");
-        Ok(Room { doc, subs: HashSet::new(), aw: HashMap::new(), idle_since: None, rows: rows.len() as i64, changed: false, captured })
+        Ok(Room { doc: Some(doc), e2ee: false, subs: HashSet::new(), aw: HashMap::new(), idle_since: None, rows: rows.len() as i64, changed: false, captured })
     }
 
     /// SYNC-Frame eines Clients verarbeiten.
@@ -173,6 +186,9 @@ impl Hub {
             g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.rooms.entry(name.to_string()).or_insert(room);
         }
+        if g.rooms.get(name).is_some_and(|r| r.e2ee) {
+            return Err(HubError::E2ee);
+        }
         match sub {
             codec::STEP1 => {
                 let sv = StateVector::decode_v1(data).map_err(|_| HubError::BadRequest("State-Vector defekt"))?;
@@ -180,7 +196,7 @@ impl Hub {
                     let room = g.rooms.get_mut(name).unwrap();
                     room.subs.insert(conn);
                     room.idle_since = None;
-                    let txn = room.doc.transact();
+                    let txn = room.doc.as_ref().ok_or(HubError::E2ee)?.transact();
                     let diff = txn.encode_state_as_update_v1(&sv);
                     let server_sv = txn.state_vector().encode_v1();
                     let aw = if room.aw.is_empty() { None } else { Some(codec::encode_awareness(room.aw.values().map(|(e, _)| e))) };
@@ -207,14 +223,15 @@ impl Hub {
                     return Ok(());
                 }
                 let room = g.rooms.get_mut(name).unwrap();
+                let doc = room.doc.as_ref().ok_or(HubError::E2ee)?;
                 {
-                    let mut txn = room.doc.transact_mut();
+                    let mut txn = doc.transact_mut();
                     txn.apply_update(update).map_err(|e| HubError::BadRequest(if e.to_string().is_empty() { "Update" } else { "Update nicht anwendbar" }))?;
                 }
                 let canonical = room.captured.lock().unwrap_or_else(|e| e.into_inner()).take();
                 let Some(canonical) = canonical else {
                     // Nichts Neues (oder wartet auf fehlende Vorgänger – dann roh sichern, damit nichts verloren geht).
-                    if room.doc.transact().has_missing_updates() {
+                    if doc.transact().has_missing_updates() {
                         let _ = self.store.lock().unwrap_or_else(|e| e.into_inner()).append_update(space, name, data);
                         room.rows += 1;
                     }
@@ -252,7 +269,9 @@ impl Hub {
 
     fn compact(&self, g: &mut Inner, name: &str) {
         let Some(room) = g.rooms.get_mut(name) else { return };
-        let state = room.doc.transact().encode_state_as_update_v1(&StateVector::default());
+        // Verschlüsselte Docs verdichtet ein Client (ECOMPACT), der Server kann es nicht.
+        let Some(doc) = room.doc.as_ref() else { return };
+        let state = doc.transact().encode_state_as_update_v1(&StateVector::default());
         let mut st = self.store.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = st.compact(name, &state) {
             warn!(doc = name, "Verdichten fehlgeschlagen: {e}");
@@ -267,6 +286,121 @@ impl Hub {
             }
         }
         debug!(doc = name, bytes = state.len(), "verdichtet");
+    }
+
+    /// Raum eines Docs sicherstellen (lädt bei Bedarf) und prüfen, dass der Space verschlüsselt ist.
+    fn ensure_e2ee_room<'a>(&'a self, mut g: std::sync::MutexGuard<'a, Inner>, name: &str) -> Result<std::sync::MutexGuard<'a, Inner>, HubError> {
+        if !g.rooms.contains_key(name) {
+            drop(g);
+            let room = self.load_room(name)?;
+            g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.rooms.entry(name.to_string()).or_insert(room);
+        }
+        if !g.rooms.get(name).is_some_and(|r| r.e2ee) {
+            return Err(HubError::BadRequest("Space ist nicht Ende-zu-Ende-verschlüsselt"));
+        }
+        Ok(g)
+    }
+
+    /// ESUB: verschlüsseltes Doc abonnieren und alle Log-Zeilen nach `since` schicken.
+    /// Abo und Lesen geschehen unter derselben Sperre – spätere Zeilen kommen sicher per EUPD.
+    pub fn on_esub(&self, conn: ConnId, name: &str, since: u64) -> Result<(), HubError> {
+        let (space, _) = codec::split_doc(name).ok_or(HubError::BadRequest("Doc-Name ungültig"))?;
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::role(&g, conn, space).ok_or(HubError::Forbidden)?;
+        let mut g = self.ensure_e2ee_room(g, name)?;
+        let (rows, total) = {
+            let st = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            let rows = st.load_updates_since(name, since).map_err(|e| HubError::Internal(e.to_string()))?;
+            let total = st.update_count(name).map_err(|e| HubError::Internal(e.to_string()))?;
+            (rows, total)
+        };
+        let aw = {
+            let room = g.rooms.get_mut(name).unwrap();
+            room.subs.insert(conn);
+            room.idle_since = None;
+            room.rows = total;
+            if room.aw.is_empty() { None } else { Some(codec::encode_awareness(room.aw.values().map(|(e, _)| e))) }
+        };
+        if let Some(c) = g.conns.get_mut(&conn) {
+            c.subs.insert(name.to_string());
+        }
+        Self::send(&g, conn, codec::elog(name, total as u64, rows.iter().map(|(id, d)| (*id, d.as_slice()))));
+        if let Some(aw) = aw {
+            Self::send(&g, conn, codec::awareness(name, &aw));
+        }
+        Ok(())
+    }
+
+    /// EUPD: verschlüsseltes Update unverändert anhängen, an die anderen Abonnenten verteilen, dem Absender
+    /// die Zeilen-ID bestätigen (EACK).
+    pub fn on_eupd(&self, conn: ConnId, name: &str, data: &[u8]) -> Result<(), HubError> {
+        let t0 = Instant::now();
+        let (space, _) = codec::split_doc(name).ok_or(HubError::BadRequest("Doc-Name ungültig"))?;
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if Self::role(&g, conn, space).ok_or(HubError::Forbidden)? == "read" {
+            return Err(HubError::Forbidden);
+        }
+        if data.is_empty() {
+            return Err(HubError::BadRequest("Update leer"));
+        }
+        let mut g = self.ensure_e2ee_room(g, name)?;
+        let (id, seq) = self
+            .store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_update_id(space, name, data)
+            .map_err(|e| HubError::Internal(e.to_string()))?;
+        let subs: Vec<ConnId> = {
+            let room = g.rooms.get_mut(name).unwrap();
+            room.rows += 1;
+            room.changed = true;
+            if room.subs.is_empty() {
+                room.idle_since = Some(Instant::now());
+            }
+            room.subs.iter().copied().filter(|c| *c != conn).collect()
+        };
+        let frame = codec::eupd(name, id, data);
+        for s in subs {
+            Self::send(&g, s, frame.clone());
+        }
+        Self::send(&g, conn, codec::eack(name, id));
+        let p = g.pending.entry(space.to_string()).or_insert((0, HashSet::new()));
+        p.0 = seq;
+        p.1.insert(name.to_string());
+        if let Some(c) = g.conns.get(&conn) {
+            c.stats.updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.update(&c.user.id, space, Some(t0.elapsed().as_micros() as u64));
+        }
+        Ok(())
+    }
+
+    /// ECOMPACT: Ein Client hat alle Zeilen bis `upto` gelesen und schickt den verschlüsselten Gesamtstand.
+    /// Ersetzt das Log bis dorthin; dient außerdem als Snapshot für die Versionsgeschichte.
+    pub fn on_ecompact(&self, conn: ConnId, name: &str, upto: u64, data: &[u8]) -> Result<(), HubError> {
+        let (space, _) = codec::split_doc(name).ok_or(HubError::BadRequest("Doc-Name ungültig"))?;
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if Self::role(&g, conn, space).ok_or(HubError::Forbidden)? == "read" {
+            return Err(HubError::Forbidden);
+        }
+        if data.is_empty() {
+            return Err(HubError::BadRequest("Stand leer"));
+        }
+        let mut g = self.ensure_e2ee_room(g, name)?;
+        let mut st = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let n = st.compact_upto(name, upto, data).map_err(|_| HubError::BadRequest("Verdichten nicht möglich"))?;
+        let ts = now();
+        let last = st.last_snapshot_ts(name).ok().flatten().unwrap_or(0);
+        if ts - last >= self.cfg.snapshot_every {
+            let _ = st.add_snapshot(name, ts, data);
+        }
+        let rows = st.update_count(name).unwrap_or(1);
+        drop(st);
+        if let Some(room) = g.rooms.get_mut(name) {
+            room.rows = rows;
+        }
+        debug!(doc = name, replaced = n, bytes = data.len(), "vom Client verdichtet");
+        Ok(())
     }
 
     pub fn on_awareness(&self, conn: ConnId, name: &str, data: &[u8]) -> Result<(), HubError> {
@@ -414,11 +548,11 @@ impl Hub {
         {
             let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(room) = g.rooms.get(name) {
-                return Ok(f(&room.doc));
+                return Ok(f(room.doc.as_ref().ok_or(HubError::E2ee)?));
             }
         }
         let room = self.load_room(name)?;
-        Ok(f(&room.doc))
+        Ok(f(room.doc.as_ref().ok_or(HubError::E2ee)?))
     }
 
     /// Änderung durch den Server selbst (Admin-Oberfläche): wie ein Client-Update speichern,
@@ -437,7 +571,7 @@ impl Hub {
             // Ohne Abonnenten nach der Nachlaufzeit wieder entladen.
             room.idle_since = Some(Instant::now());
         }
-        let out = f(&room.doc);
+        let out = f(room.doc.as_ref().ok_or(HubError::E2ee)?);
         let canonical = room.captured.lock().unwrap_or_else(|e| e.into_inner()).take();
         let Some(canonical) = canonical else { return Ok(out) };
         room.rows += 1;
@@ -609,5 +743,91 @@ mod tests {
         };
         assert!(matches!(h.on_sync(c, "sp/x", codec::UPDATE, &u), Err(HubError::Forbidden)));
         assert!(matches!(h.on_sync(c, "other/x", codec::STEP1, &[0]), Err(HubError::Forbidden)));
+    }
+
+    fn frames(rx: &mut mpsc::Receiver<Out>) -> Vec<Vec<u8>> {
+        let mut v = Vec::new();
+        while let Ok(Out::Frame(f)) = rx.try_recv() {
+            v.push(f);
+        }
+        v
+    }
+
+    /// ELOG lesen → (total, [(id, data)])
+    fn read_elog(f: &[u8]) -> (u64, Vec<(u64, Vec<u8>)>) {
+        let mut r = codec::Reader::new(f);
+        assert_eq!(r.var_uint().unwrap(), codec::ELOG);
+        r.string().unwrap();
+        let total = r.var_uint().unwrap();
+        let n = r.var_uint().unwrap();
+        (total, (0..n).map(|_| (r.var_uint().unwrap(), r.bytes().unwrap().to_vec())).collect())
+    }
+
+    #[test]
+    fn e2ee_relay() {
+        let h = hub();
+        {
+            let st = h.store.lock().unwrap();
+            st.add_space("enc", "Enc").unwrap();
+            st.set_member("enc", "a", "write").unwrap();
+            st.set_space_e2ee("enc", Some(crate::db::E2EE_PENDING)).unwrap();
+            st.set_space_e2ee("enc", Some("{\"v\":1}")).unwrap();
+        }
+        let spaces = HashMap::from([("enc".to_string(), "write".to_string())]);
+        let (tx1, mut rx1) = mpsc::channel(100);
+        let (tx2, mut rx2) = mpsc::channel(100);
+        let c1 = h.register(tx1, user(), "d1".into(), "t1".into(), spaces.clone(), Default::default());
+        let c2 = h.register(tx2, user(), "d2".into(), "t2".into(), spaces, Default::default());
+
+        // Klartext-Yjs ist in verschlüsselten Spaces gesperrt, ebenso der Server-Lesezugriff
+        assert!(matches!(h.on_sync(c1, "enc/x", codec::STEP1, &StateVector::default().encode_v1()), Err(HubError::E2ee)));
+        assert!(matches!(h.read_doc("enc/x", |_| ()), Err(HubError::E2ee)));
+        // …und umgekehrt keine E-Frames in Klartext-Spaces
+        assert!(h.on_esub(c1, "sp/x", 0).is_err());
+
+        h.on_esub(c1, "enc/x", 0).unwrap();
+        h.on_esub(c2, "enc/x", 0).unwrap();
+        assert_eq!(read_elog(&frames(&mut rx1)[0]), (0, vec![]));
+        frames(&mut rx2);
+
+        h.on_eupd(c1, "enc/x", b"chiffre-1").unwrap();
+        h.on_eupd(c1, "enc/x", b"chiffre-2").unwrap();
+        // Absender bekommt EACKs, der andere die Updates unverändert
+        let f1 = frames(&mut rx1);
+        assert_eq!(f1.len(), 2);
+        let mut r = codec::Reader::new(&f1[1]);
+        assert_eq!(r.var_uint().unwrap(), codec::EACK);
+        r.string().unwrap();
+        let id2 = r.var_uint().unwrap();
+        let f2 = frames(&mut rx2);
+        assert_eq!(f2.len(), 2);
+        assert_eq!(f2[1], codec::eupd("enc/x", id2, b"chiffre-2"));
+
+        // Nachladen ab 0 → beide Zeilen; ab id2 → nichts
+        h.on_esub(c2, "enc/x", 0).unwrap();
+        let (total, rows) = read_elog(&frames(&mut rx2)[0]);
+        assert_eq!((total, rows.len()), (2, 2));
+        assert_eq!(rows[1], (id2, b"chiffre-2".to_vec()));
+        h.on_esub(c2, "enc/x", id2).unwrap();
+        assert_eq!(read_elog(&frames(&mut rx2)[0]).1.len(), 0);
+
+        // Verdichten durch den Client: Zeile behält die ID id2, Snapshot entsteht
+        h.on_eupd(c1, "enc/x", b"chiffre-3").unwrap();
+        h.on_ecompact(c1, "enc/x", id2, b"gesamt-1-2").unwrap();
+        h.on_esub(c2, "enc/x", 0).unwrap();
+        let (_, rows) = read_elog(frames(&mut rx2).last().unwrap());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (id2, b"gesamt-1-2".to_vec()));
+        assert_eq!(rows[1].1, b"chiffre-3".to_vec());
+        assert_eq!(h.store.lock().unwrap().snapshots("enc/x").unwrap().len(), 1);
+        // Fremde Zeilen-ID → abgelehnt
+        assert!(h.on_ecompact(c1, "enc/x", 999_999, b"x").is_err());
+
+        // Lesende dürfen nichts anhängen
+        let (tx3, _rx3) = mpsc::channel(100);
+        let c3 = h.register(tx3, user(), "d3".into(), "t3".into(), HashMap::from([("enc".to_string(), "read".to_string())]), Default::default());
+        assert!(matches!(h.on_eupd(c3, "enc/x", b"x"), Err(HubError::Forbidden)));
+        // Verschlüsselung lässt sich bei Inhalt nicht mehr umschalten
+        assert!(h.store.lock().unwrap().set_space_e2ee("enc", None).is_err());
     }
 }

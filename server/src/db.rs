@@ -42,7 +42,14 @@ pub struct SpaceRole {
     pub id: String,
     pub name: String,
     pub role: String,
+    /// Ende-zu-Ende-Verschlüsselung: fehlt = Klartext, `"pending"` = Besitzer muss die Passphrase noch
+    /// festlegen, sonst die öffentlichen Schlüsselparameter `{v, salt, iter, check}` (siehe docs/E2EE.md).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e2ee: Option<serde_json::Value>,
 }
+
+/// Wert der Spalte `spaces.e2ee` für „verschlüsselt, Passphrase noch nicht festgelegt“.
+pub const E2EE_PENDING: &str = "\"pending\"";
 
 pub struct Store {
     pub conn: Connection,
@@ -82,11 +89,19 @@ impl Store {
                  expires INTEGER NOT NULL, pw_hash TEXT, totp_secret TEXT, tries INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS admin_sessions (hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                  created INTEGER NOT NULL, last_seen INTEGER NOT NULL, ip TEXT NOT NULL, agent TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS admin_passkeys (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES admins(user_id) ON DELETE CASCADE,
+                 name TEXT NOT NULL, cose BLOB NOT NULL, alg INTEGER NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0,
+                 created INTEGER NOT NULL, last_used INTEGER);
              CREATE TABLE IF NOT EXISTS metrics_hourly (ts INTEGER PRIMARY KEY, data TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, user_id TEXT NOT NULL,
                  ip TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);",
         )?;
+        // Migration 0.5: Ende-zu-Ende-Verschlüsselung pro Space (NULL = Klartext, sonst JSON).
+        let has_e2ee: bool = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('spaces') WHERE name = 'e2ee'", [], |r| r.get::<_, i64>(0))? > 0;
+        if !has_e2ee {
+            conn.execute_batch("ALTER TABLE spaces ADD COLUMN e2ee TEXT")?;
+        }
         Ok(Self { conn })
     }
 
@@ -154,10 +169,42 @@ impl Store {
 
     pub fn spaces_of(&self, user: &str) -> Result<Vec<SpaceRole>> {
         let mut st = self.conn.prepare(
-            "SELECT s.id, s.name, m.role FROM members m JOIN spaces s ON s.id = m.space WHERE m.user_id = ?1 ORDER BY s.id",
+            "SELECT s.id, s.name, m.role, s.e2ee FROM members m JOIN spaces s ON s.id = m.space WHERE m.user_id = ?1 ORDER BY s.id",
         )?;
-        let v = st.query_map([user], |r| Ok(SpaceRole { id: r.get(0)?, name: r.get(1)?, role: r.get(2)? }))?.collect::<Result<_, _>>()?;
+        let v = st
+            .query_map([user], |r| {
+                let e2ee: Option<String> = r.get(3)?;
+                Ok(SpaceRole { id: r.get(0)?, name: r.get(1)?, role: r.get(2)?, e2ee: e2ee.and_then(|j| serde_json::from_str(&j).ok()) })
+            })?
+            .collect::<Result<_, _>>()?;
         Ok(v)
+    }
+
+    // ── Ende-zu-Ende-Verschlüsselung ─────────────────────────────────
+
+    /// Roh-JSON der E2EE-Einstellung eines Space (None = Klartext).
+    pub fn space_e2ee(&self, space: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT e2ee FROM spaces WHERE id = ?1", [space], |r| r.get(0)).optional()?.flatten())
+    }
+
+    /// Hat der Space noch keinerlei Inhalt (keine Docs, keine Anhänge)?
+    pub fn space_empty(&self, space: &str) -> Result<bool> {
+        let docs: i64 = self.conn.query_row("SELECT COUNT(*) FROM docs WHERE space = ?1", [space], |r| r.get(0))?;
+        let blobs: i64 = self.conn.query_row("SELECT COUNT(*) FROM blobs WHERE space = ?1", [space], |r| r.get(0))?;
+        Ok(docs == 0 && blobs == 0)
+    }
+
+    /// E2EE-Einstellung setzen. Nur erlaubt, solange der Space leer ist oder auf die Passphrase wartet
+    /// – sonst lägen Klartext und Chiffretext gemischt im selben Space.
+    pub fn set_space_e2ee(&self, space: &str, value: Option<&str>) -> Result<()> {
+        let cur = self.conn.query_row("SELECT e2ee FROM spaces WHERE id = ?1", [space], |r| r.get::<_, Option<String>>(0)).optional()?;
+        let Some(cur) = cur else { bail!("Vault {space} nicht gefunden") };
+        let pending = cur.as_deref() == Some(E2EE_PENDING);
+        if !pending && !self.space_empty(space)? {
+            bail!("Der Vault enthält schon Dateien – Verschlüsselung lässt sich nur für einen leeren Vault ein- oder ausschalten");
+        }
+        self.conn.execute("UPDATE spaces SET e2ee = ?2 WHERE id = ?1", params![space, value])?;
+        Ok(())
     }
 
     pub fn spaces(&self) -> Result<Vec<(String, String, i64, i64)>> {
@@ -263,6 +310,13 @@ impl Store {
 
     // ── Docs ─────────────────────────────────────────────────────────
 
+    /// Gespeicherte Updates nach `since` samt Zeilen-ID (verschlüsselte Spaces: das Log ist die Wahrheit).
+    pub fn load_updates_since(&self, doc: &str, since: u64) -> Result<Vec<(u64, Vec<u8>)>> {
+        let mut st = self.conn.prepare_cached("SELECT id, data FROM updates WHERE doc = ?1 AND id > ?2 ORDER BY id")?;
+        let v = st.query_map(params![doc, since as i64], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        Ok(v)
+    }
+
     pub fn load_updates(&self, doc: &str) -> Result<Vec<Vec<u8>>> {
         let mut st = self.conn.prepare_cached("SELECT data FROM updates WHERE doc = ?1 ORDER BY id")?;
         let v = st.query_map([doc], |r| r.get(0))?.collect::<Result<_, _>>()?;
@@ -271,9 +325,15 @@ impl Store {
 
     /// Update speichern, Sequenznummer des Space erhöhen. Liefert die neue Sequenz.
     pub fn append_update(&mut self, space: &str, doc: &str, data: &[u8]) -> Result<u64> {
+        Ok(self.append_update_id(space, doc, data)?.1)
+    }
+
+    /// Wie `append_update`, liefert (Zeilen-ID, Sequenz).
+    pub fn append_update_id(&mut self, space: &str, doc: &str, data: &[u8]) -> Result<(u64, u64)> {
         let tx = self.conn.transaction()?;
         let ts = now();
         tx.execute("INSERT INTO updates (doc, data, ts) VALUES (?1, ?2, ?3)", params![doc, data, ts])?;
+        let id = tx.last_insert_rowid();
         tx.execute("UPDATE spaces SET seq = seq + 1 WHERE id = ?1", [space])?;
         let seq: i64 = tx.query_row("SELECT seq FROM spaces WHERE id = ?1", [space], |r| r.get(0))?;
         tx.execute(
@@ -282,7 +342,25 @@ impl Store {
             params![doc, space, seq, ts, data.len() as i64],
         )?;
         tx.commit()?;
-        Ok(seq as u64)
+        Ok((id as u64, seq as u64))
+    }
+
+    /// Verdichten durch einen Client (verschlüsselte Spaces): alle Zeilen bis einschließlich `upto` durch
+    /// `merged` ersetzen. Die neue Zeile behält die ID `upto`, damit Clients, die schon bis dorthin gelesen
+    /// haben, sie nicht noch einmal laden. `upto` muss eine vorhandene Zeile dieses Docs sein.
+    /// Liefert die Zahl der ersetzten Zeilen.
+    pub fn compact_upto(&mut self, doc: &str, upto: u64, merged: &[u8]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let exists: i64 = tx.query_row("SELECT COUNT(*) FROM updates WHERE doc = ?1 AND id = ?2", params![doc, upto as i64], |r| r.get(0))?;
+        if exists == 0 {
+            bail!("Zeile {upto} gehört nicht zu {doc}");
+        }
+        let n = tx.execute("DELETE FROM updates WHERE doc = ?1 AND id <= ?2", params![doc, upto as i64])?;
+        tx.execute("INSERT INTO updates (id, doc, data, ts) VALUES (?1, ?2, ?3, ?4)", params![upto as i64, doc, merged, now()])?;
+        let size: i64 = tx.query_row("SELECT COALESCE(SUM(length(data)),0) FROM updates WHERE doc = ?1", [doc], |r| r.get(0))?;
+        tx.execute("UPDATE docs SET size = ?2 WHERE doc = ?1", params![doc, size])?;
+        tx.commit()?;
+        Ok(n)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -499,6 +577,8 @@ impl Store {
         )?;
         tx.execute("DELETE FROM admin_setup WHERE hash = ?1", [&h])?;
         tx.execute("DELETE FROM admin_sessions WHERE user_id = ?1", [&user])?;
+        // Neu einrichten = sauberer Neuanfang: alte Passkeys (evtl. auf verlorenem Gerät) gelten nicht mehr.
+        tx.execute("DELETE FROM admin_passkeys WHERE user_id = ?1", [&user])?;
         tx.commit()?;
         Ok(user)
     }
@@ -532,12 +612,53 @@ impl Store {
         Ok(())
     }
 
-    pub fn admin_login_ok(&self, user: &str, totp_step: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE admins SET failed = 0, locked_until = 0, totp_last = ?2, last_login = ?3 WHERE user_id = ?1",
-            params![user, totp_step, now()],
-        )?;
+    /// Erfolgreiche Anmeldung. Mit TOTP-Schritt: nur, wenn dieser Code noch nicht benutzt wurde
+    /// (verhindert, dass zwei gleichzeitige Anmeldungen denselben Code verbrauchen). Liefert false bei Wiederholung.
+    pub fn admin_login_ok(&self, user: &str, totp_step: Option<i64>) -> Result<bool> {
+        let n = match totp_step {
+            Some(step) => self.conn.execute(
+                "UPDATE admins SET failed = 0, locked_until = 0, totp_last = ?2, last_login = ?3 WHERE user_id = ?1 AND totp_last < ?2",
+                params![user, step, now()],
+            )?,
+            None => self.conn.execute("UPDATE admins SET failed = 0, locked_until = 0, last_login = ?2 WHERE user_id = ?1", params![user, now()])?,
+        };
+        Ok(n == 1)
+    }
+
+    // ── Passkeys (zweiter Faktor) ────────────────────────────────────
+
+    pub fn add_passkey(&self, user: &str, id: &str, name: &str, cose: &[u8], alg: i64, count: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO admin_passkeys (id, user_id, name, cose, alg, sign_count, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, user, name, cose, alg, count, now()],
+            )
+            .context("Passkey ist schon eingerichtet")?;
         Ok(())
+    }
+
+    /// (id, name, created, last_used)
+    pub fn passkeys(&self, user: &str) -> Result<Vec<(String, String, i64, Option<i64>)>> {
+        let mut st = self.conn.prepare("SELECT id, name, created, last_used FROM admin_passkeys WHERE user_id = ?1 ORDER BY created")?;
+        let v = st.query_map([user], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+        Ok(v)
+    }
+
+    /// Öffentlicher Schlüssel + Zähler eines Passkeys dieses Nutzers.
+    pub fn passkey(&self, user: &str, id: &str) -> Result<Option<(Vec<u8>, u32)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT cose, sign_count FROM admin_passkeys WHERE user_id = ?1 AND id = ?2", params![user, id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+
+    pub fn passkey_used(&self, id: &str, count: u32) -> Result<()> {
+        self.conn.execute("UPDATE admin_passkeys SET sign_count = ?2, last_used = ?3 WHERE id = ?1", params![id, count, now()])?;
+        Ok(())
+    }
+
+    pub fn remove_passkey(&self, user: &str, id: &str) -> Result<bool> {
+        Ok(self.conn.execute("DELETE FROM admin_passkeys WHERE user_id = ?1 AND id = ?2", params![user, id])? > 0)
     }
 
     pub fn admins(&self) -> Result<Vec<(String, i64, Option<i64>)>> {

@@ -113,6 +113,7 @@ pub async fn files(State(app): State<App>, h: HeaderMap, Path(space): Path<Strin
     }
     let entries = match app.hub.read_doc(&index_name(&space), vault::read_index) {
         Ok(e) => live(e),
+        Err(crate::hub::HubError::E2ee) => return (StatusCode::CONFLICT, "Vault ist Ende-zu-Ende-verschlüsselt").into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response(),
     };
     let stats = match doc_stats(&app, &space) {
@@ -142,6 +143,7 @@ pub async fn file(State(app): State<App>, h: HeaderMap, Path((space, id)): Path<
     }
     let entries = match app.hub.read_doc(&index_name(&space), vault::read_index) {
         Ok(e) => e,
+        Err(crate::hub::HubError::E2ee) => return (StatusCode::CONFLICT, "Vault ist Ende-zu-Ende-verschlüsselt").into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response(),
     };
     let Some(entry) = entries.into_iter().find(|e| e.id == id && !e.del) else {

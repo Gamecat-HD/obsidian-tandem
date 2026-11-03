@@ -252,6 +252,9 @@ input[type="checkbox"], input[type="radio"] { width: 15px; height: 15px; margin:
 .field.row.wrap { flex-wrap: wrap; }
 .field.row > label { font-size: 13px; color: var(--fg); font-weight: 400; }
 .form-error { color: var(--danger); font-size: 13px; margin: 4px 0 8px; min-height: 1.45em; }
+.field.check { gap: 4px; }
+.field.check .field.row { margin-bottom: 0; }
+.field.check .hint { padding-left: 23px; }
 .dlg .form-error:empty { min-height: 0; margin: 0; }
 .inline { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .cmd { display: flex; align-items: center; gap: 6px; margin: 4px 0; max-width: 100%; }
@@ -332,6 +335,17 @@ ul.rows { list-style: none; margin: 0; padding: 0; }
 .badge.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
 .badge.danger { color: var(--danger); border-color: var(--danger); }
 .badge.ok { color: var(--ok); border-color: var(--ok); }
+.badge.e2ee { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); white-space: normal; }
+.vh-title .e2ee-slot:empty { display: none; }
+.vh-title .badge.e2ee { margin-left: 0; }
+
+/* Hinweis statt Dateibaum bei Ende-zu-Ende-verschlüsselten Vaults */
+.e2ee-note { width: min(520px, 100%); margin: 0 auto; padding: 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-2); color: var(--fg); }
+.e2ee-note h3 { margin: 0 0 8px; font-size: 15px; }
+.e2ee-note p { margin: 0 0 10px; }
+.e2ee-note p:last-child { margin-bottom: 0; }
+.e2ee-note .warn-note { margin-top: 12px; }
+.page > .e2ee-note, .bk-vaults > .e2ee-note, .bk-list > .e2ee-note { margin: 12px auto; }
 
 .dot {
   display: inline-block; width: 8px; height: 8px; border-radius: 50%;
@@ -426,6 +440,9 @@ dialog.overlay::backdrop { background: var(--bg-2); }
 .auth .sub { color: var(--fg-2); margin: -6px 0 16px; font-size: 13px; }
 .auth .btn.primary { width: 100%; min-height: 34px; }
 .auth .back { margin: 14px 0 0; text-align: center; font-size: 13px; }
+.auth .back .linkish { font-size: 13px; }
+.auth .sub strong { color: var(--fg); }
+.passkeys .side .btn { white-space: nowrap; }
 .qr { display: block; width: 200px; height: 200px; margin: 0 auto 10px; background: #fff; padding: 8px; border-radius: var(--radius); border: 1px solid var(--border); }
 .secret { display: flex; gap: 6px; align-items: center; }
 .secret code { flex: 1; padding: 6px 8px; background: var(--bg-2); border-radius: var(--radius); font-size: 13px; letter-spacing: 0.02em; user-select: all; word-spacing: 0.15em; }
@@ -891,6 +908,9 @@ fieldset.keep:disabled { opacity: 0.55; }
 .bk-body { display: grid; grid-template-columns: minmax(280px, 400px) minmax(0, 1fr); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
 @media (min-width: 901px) { .bk-body { min-height: 420px; } }
 .bk-list { border-right: 1px solid var(--border); background: var(--bg-2); overflow: auto; max-height: 70vh; }
+.bk-body.e2ee { grid-template-columns: 1fr; }
+.bk-body.e2ee .bk-list { border-right: 0; background: var(--bg); padding: 12px; }
+.bk-body.e2ee .bk-preview { display: none; }
 .bk-all { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; position: sticky; top: 0; background: var(--bg-2); z-index: 1; }
 ul.bk-files { list-style: none; margin: 0; padding: 4px; }
 .bk-files .folder { font-size: 12px; color: var(--fg-3); padding: 6px 6px 2px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -925,6 +945,8 @@ ul.bk-files { list-style: none; margin: 0; padding: 4px; }
   .top { gap: 8px; padding: 0 10px; }
   .vault-head { padding: 8px 10px 0; }
   .vault-head .toolbar { margin-left: 0; width: 100%; }
+  .vh-title { flex-wrap: wrap; }
+  .vault-head .crumb { white-space: nowrap; }
   .drawer-btn { display: inline-flex; }
   .tree-pane {
     position: fixed; top: 0; bottom: 0; left: 0; width: min(320px, 85vw); z-index: 45;

@@ -302,6 +302,9 @@ pub fn export_tar(conn: &Connection, blob_dir: &Path, space: &str, out: &mut imp
     if !spaces(conn)?.iter().any(|s| s.0 == space) {
         bail!("Vault {space} nicht gefunden");
     }
+    if is_e2ee(conn, space) {
+        bail!("Vault {space} ist Ende-zu-Ende-verschlüsselt – exportieren lässt er sich nur aus Obsidian heraus");
+    }
     let entries = load_doc(conn, &format!("{space}/{}", vault::INDEX))?.map(|d| vault::read_index(&d)).unwrap_or_default();
     let mut winners: std::collections::BTreeMap<String, &vault::Entry> = std::collections::BTreeMap::new();
     for e in entries.iter().filter(|e| !e.del) {
@@ -340,6 +343,11 @@ pub fn export_tar(conn: &Connection, blob_dir: &Path, space: &str, out: &mut imp
     }
     out.write_all(&crate::tar::trailer())?;
     Ok(n)
+}
+
+/// Ist der Space in dieser Datenbank Ende-zu-Ende-verschlüsselt? (Ältere Sicherungen haben die Spalte nicht.)
+pub fn is_e2ee(conn: &Connection, space: &str) -> bool {
+    conn.query_row("SELECT e2ee FROM spaces WHERE id = ?1", [space], |r| r.get::<_, Option<String>>(0)).ok().flatten().is_some()
 }
 
 /// Spaces einer Sicherung.

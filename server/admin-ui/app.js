@@ -357,6 +357,7 @@ async function downloadUrl(url, filename) {
   return true;
 }
 async function exportVault(space, backupName) {
+  if (spaceE2ee(space) !== 'off') { toast('Dieser Vault ist Ende-zu-Ende-verschlüsselt – ein Export ist nur aus Obsidian möglich.'); return; }
   const url = backupName ? `${API}backups/${enc(backupName)}/spaces/${enc(space)}/export` : `${API}spaces/${enc(space)}/export`;
   if (await downloadUrl(url)) toast('Export wird heruntergeladen');
 }
@@ -389,6 +390,27 @@ async function loadSpaces(cached) {
   return state.spaces;
 }
 function userById(id) { return (Array.isArray(state.users) ? state.users : []).find((u) => u && u.id === id) || null; }
+
+// Ende-zu-Ende-verschlüsselte Vaults: 'off' | 'pending' | 'on'; Inhalte sind dem Server und dieser Oberfläche verborgen
+function e2eeOf(s) { return s && (s.e2ee === 'on' || s.e2ee === 'pending') ? s.e2ee : 'off'; }
+function spaceE2ee(id) { return e2eeOf((state.spaces || []).find((x) => x && x.id === id)); }
+function isE2eeErr(e) { return !!(e && e.status === 409 && /Ende-zu-Ende/.test(e.message)); }
+function e2eeBadge(s, cls) {
+  const st = e2eeOf(s);
+  if (st === 'off') return null;
+  return h('span', { class: 'badge e2ee' + (cls ? ' ' + cls : ''), title: st === 'on' ? 'Inhalte sind auf den Geräten verschlüsselt und nur in Obsidian lesbar.' : 'Verschlüsselung angelegt – die Passphrase legt der Besitzer beim ersten Verbinden in Obsidian fest.',
+    text: st === 'on' ? 'Ende-zu-Ende-verschlüsselt' : 'Verschlüsselt – wartet auf Passphrase' });
+}
+// Ruhiger Hinweis anstelle von Dateibaum, Suche, Export usw.
+function e2eeNotice(st, extra) {
+  return h('div', { class: 'e2ee-note' },
+    h('h3', { text: st === 'pending' ? 'Verschlüsselt – wartet auf Passphrase' : 'Ende-zu-Ende-verschlüsselt' }),
+    h('p', { text: st === 'pending'
+      ? 'Dieser Vault ist für Ende-zu-Ende-Verschlüsselung angelegt. Die Passphrase legt der Besitzer beim ersten Verbinden in Obsidian fest.'
+      : 'Die Inhalte dieses Vaults werden auf den Geräten verschlüsselt. Der Server und diese Oberfläche können sie nicht lesen.' }),
+    h('p', { class: 'dim small', text: 'Dateien, Suche, Export, Verlauf und Wiederherstellung einzelner Dateien gibt es hier deshalb nicht; die Lese-API steht für diesen Vault nicht zur Verfügung. Mitglieder, Statistik und Sicherungen der ganzen Datenbank funktionieren wie gewohnt.' }),
+    extra || null);
+}
 function spaceName(id, spaces) {
   const s = (Array.isArray(spaces) ? spaces : (state.spaces || [])).find((x) => x && x.id === id);
   return s && s.name ? s.name : id;
@@ -554,57 +576,176 @@ function markInvalid(fields, bad, err, text) {
   err.textContent = text;
 }
 
+// WebAuthn: base64url (ohne Padding) ↔ ArrayBuffer
+function b64urlToBuf(s) {
+  const b = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(b + '='.repeat((4 - b.length % 4) % 4));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+function bufToB64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (const x of bytes) bin += String.fromCharCode(x);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+const hasWebAuthn = () => !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.get);
+
+// Passkey-Abfrage für den zweiten Schritt der Anmeldung → Antwort fürs Backend
+async function passkeyAssert(pk) {
+  const cred = await navigator.credentials.get({ publicKey: {
+    challenge: b64urlToBuf(pk.challenge),
+    rpId: pk.rpId || undefined,
+    timeout: pk.timeout || 120000,
+    userVerification: pk.userVerification || 'required',
+    allowCredentials: (Array.isArray(pk.allowCredentials) ? pk.allowCredentials : []).map((c) => ({ type: c.type || 'public-key', id: b64urlToBuf(c.id) })),
+  } });
+  return { id: cred.id, response: {
+    clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+    authenticatorData: bufToB64url(cred.response.authenticatorData),
+    signature: bufToB64url(cred.response.signature),
+  } };
+}
+
+// Sperre nach zu vielen Fehlversuchen: Knopf lokal bis zum Ablauf sperren (kein Netzverkehr)
 let lockTimer = null;
-function showLogin(done, reason) {
+function applyLock(ex, submit, err) {
+  const m = ex.status === 429 && /in (\d+) min/.exec(ex.message);
+  if (!m) return false;
+  const until = Date.now() + Number(m[1]) * 60000;
+  err.textContent = `Zu viele Fehlversuche. Anmelden wieder ab ${tfHM.format(new Date(until))} Uhr möglich.`;
+  setTimeout(() => { submit.disabled = true; }, 0);
+  clearTimeout(lockTimer);
+  lockTimer = setTimeout(() => { submit.disabled = false; err.textContent = ''; }, until - Date.now());
+  return true;
+}
+
+// Schritt 1: Kennung + Passwort. `reason`: 'expired' | 'logout' | 'again' (zweiter Schritt abgelaufen); `note` ersetzt den Untertitel.
+function showLogin(done, reason, note) {
   const err = h('div', { class: 'form-error', id: 'auth-error', role: 'alert' });
   const user = h('input', { class: 'input', id: 'l-user', name: 'username', autocomplete: 'username', required: true, autocapitalize: 'none', spellcheck: 'false', 'aria-describedby': 'auth-error' });
   const pass = h('input', { class: 'input', id: 'l-pass', type: 'password', name: 'password', autocomplete: 'current-password', required: true, 'aria-describedby': 'auth-error' });
-  const totp = totpInput('l-totp');
-  const fields = [user, pass, totp];
+  const fields = [user, pass];
   for (const f of fields) f.addEventListener('input', () => f.removeAttribute('aria-invalid'));
-  const submit = h('button', { class: 'btn primary', type: 'submit', text: 'Anmelden' });
-  const sub = reason === 'expired' && state.me ? 'Die Sitzung ist abgelaufen. Nach der Anmeldung geht es an derselben Stelle weiter.'
-    : reason === 'logout' ? 'Abgemeldet.' : null;
+  const submit = h('button', { class: 'btn primary', type: 'submit', text: 'Weiter' });
+  const sub = note || (reason === 'expired' && state.me ? 'Die Sitzung ist abgelaufen. Nach der Anmeldung geht es an derselben Stelle weiter.'
+    : reason === 'logout' ? 'Abgemeldet.' : null);
   const form = h('form', { class: 'auth', novalidate: true, onsubmit: async (e) => {
     e.preventDefault();
     if (submit.disabled) return;
     if (!user.value.trim()) return markInvalid(fields, user, err, 'Kennung eingeben.');
     if (!pass.value) return markInvalid(fields, pass, err, 'Passwort eingeben.');
-    if (!/^\d{6}$/.test(totp.value.trim())) return markInvalid(fields, totp, err, 'Sechsstelligen Code aus der Authenticator-App eingeben.');
     markInvalid(fields, null, err, '');
     await busy(submit, async () => {
       try {
-        const me = await api('login', { method: 'POST', noAuth: true, quiet: true, body: { user: user.value.trim(), password: pass.value, totp: totp.value.trim() } });
-        setMe(me);
-        hideOverlay();
-        done(me);
+        const uid = user.value.trim();
+        const r = await api('login', { method: 'POST', noAuth: true, quiet: true, body: { user: uid, password: pass.value } });
+        writePref('login.user', uid);
+        showSecondFactor(done, r || {}, uid);
       } catch (ex) {
+        if (applyLock(ex, submit, err)) return;
         err.textContent = ex.message;
-        totp.value = '';
-        totp.focus();
-        // Sperre: Knopf lokal bis zum Ablauf sperren (kein Netzverkehr)
-        const m = ex.status === 429 && /in (\d+) min/.exec(ex.message);
-        if (m) {
-          const until = Date.now() + Number(m[1]) * 60000;
-          err.textContent = `Zu viele Fehlversuche. Anmelden wieder ab ${tfHM.format(new Date(until))} Uhr möglich.`;
-          setTimeout(() => { submit.disabled = true; }, 0);
-          clearTimeout(lockTimer);
-          lockTimer = setTimeout(() => { submit.disabled = false; err.textContent = ''; }, until - Date.now());
-        }
+        if (ex.status === 401) { pass.value = ''; markInvalid(fields, pass, err, ex.message); }
       }
-    }, 'Anmelden …');
+    }, 'Prüfe …');
   } },
     h('h1', { id: 'auth-title', text: 'Tandem Admin' }),
     sub ? h('p', { class: 'sub', text: sub }) : null,
     h('div', { class: 'field' }, h('label', { for: 'l-user', text: 'Kennung' }), user),
     h('div', { class: 'field' }, h('label', { for: 'l-pass', text: 'Passwort' }), pass),
-    h('div', { class: 'field' }, h('label', { for: 'l-totp', text: 'Code aus der Authenticator-App' }), totp),
     err,
     submit,
   );
   if (state.me && state.me.user && reason !== 'logout') user.value = state.me.user.id;
+  if (!user.value) user.value = readPref('login.user') || '';
   showOverlay(form, 'Anmelden');
   (user.value ? pass : user).focus();
+}
+
+// Schritt 2: Passkey (sofort abgefragt) oder Code aus der Authenticator-App. r = Antwort von POST login.
+function showSecondFactor(done, r, uid) {
+  const methods = Array.isArray(r.methods) ? r.methods : ['totp'];
+  const canPasskey = methods.includes('passkey') && r.passkey && hasWebAuthn();
+  const err = h('div', { class: 'form-error', id: 'auth-error', role: 'alert' });
+  let finished = false;
+
+  const finish = (me) => { finished = true; setMe(me); hideOverlay(); done(me); };
+  // Ticket verbraucht/abgelaufen → zurück zu Schritt 1 mit Hinweis
+  const restart = (msg) => { if (!finished) showLogin(done, 'again', msg || 'Anmeldung abgelaufen – bitte noch einmal mit Passwort anmelden.'); };
+  const expired = (ex) => ex.status === 401 && /abgelaufen|nicht mehr vorhanden/.test(ex.message);
+  const backLink = h('p', { class: 'back' }, h('a', { href: '#/', text: 'Zurück', onclick: (e) => { e.preventDefault(); showLogin(done, null); } }));
+
+  // --- Code-Eingabe (immer möglich)
+  const totp = totpInput('l-totp');
+  const codeBtn = h('button', { class: 'btn primary', type: 'submit', text: 'Anmelden' });
+  const codeForm = h('form', { class: 'auth', novalidate: true, onsubmit: async (e) => {
+    e.preventDefault();
+    if (codeBtn.disabled) return;
+    const code = totp.value.trim();
+    if (!/^\d{6}$/.test(code)) return markInvalid([totp], totp, err, 'Sechsstelligen Code aus der Authenticator-App eingeben.');
+    markInvalid([totp], null, err, '');
+    await busy(codeBtn, async () => {
+      try {
+        finish(await api('login/totp', { method: 'POST', noAuth: true, quiet: true, body: { ticket: r.ticket, code } }));
+      } catch (ex) {
+        if (expired(ex)) { restart(ex.message); return; }
+        totp.value = '';
+        if (!applyLock(ex, codeBtn, err)) markInvalid([totp], totp, err, ex.message);
+        else totp.focus();
+      }
+    }, 'Anmelden …');
+  } },
+    h('h1', { id: 'auth-title', text: 'Tandem Admin' }),
+    h('p', { class: 'sub' }, 'Konto ', h('strong', { text: esc(uid) }), ' · zweiter Schritt'),
+    h('div', { class: 'field' }, h('label', { for: 'l-totp', text: 'Code aus der Authenticator-App' }), totp),
+    err,
+    codeBtn,
+    backLink,
+  );
+  // Sechs Ziffern → direkt abschicken
+  totp.addEventListener('input', () => { totp.removeAttribute('aria-invalid'); if (/^\d{6}$/.test(totp.value)) codeForm.requestSubmit(); });
+  // `err` ist ein Knoten für beide Ansichten (Passkey/Code) – beim Umschalten mitnehmen
+  const showCode = () => { err.textContent = ''; codeBtn.before(err); showOverlay(codeForm, 'Anmelden'); totp.focus(); };
+
+  if (!canPasskey) { showCode(); return; }
+
+  // --- Passkey
+  const pkBtn = h('button', { class: 'btn primary', type: 'button', text: 'Mit Passkey bestätigen' });
+  const codeLink = h('button', { class: 'linkish', type: 'button', text: 'Stattdessen Code eingeben', onclick: () => showCode() });
+  const status = h('p', { class: 'sub', 'aria-live': 'polite', text: 'Bitte den Passkey bestätigen – z. B. per Fingerabdruck, Gesicht oder Sicherheitsschlüssel.' });
+  const pkBox = h('div', { class: 'auth' },
+    h('h1', { id: 'auth-title', text: 'Tandem Admin' }),
+    h('p', { class: 'sub' }, 'Konto ', h('strong', { text: esc(uid) }), ' · zweiter Schritt'),
+    status,
+    err,
+    pkBtn,
+    h('p', { class: 'back' }, codeLink, ' · ', h('a', { href: '#/', text: 'Zurück', onclick: (e) => { e.preventDefault(); showLogin(done, null); } })),
+  );
+  let running = false;
+  const tryPasskey = async () => {
+    if (running || finished) return;
+    running = true;
+    err.textContent = '';
+    try {
+      let credential;
+      try { credential = await passkeyAssert(r.passkey); } catch (ex) {
+        // Abgebrochen oder vom Browser abgelehnt: ruhig auf dem Schritt bleiben
+        if (ex && ex.name === 'NotAllowedError') return;
+        err.textContent = ex && ex.name === 'SecurityError' ? 'Der Passkey passt nicht zu dieser Adresse.' : `Passkey nicht möglich: ${ex && ex.message ? ex.message : ex}`;
+        return;
+      }
+      if (finished || !overlay.contains(pkBox)) return;
+      finish(await api('login/passkey', { method: 'POST', noAuth: true, quiet: true, body: { ticket: r.ticket, credential } }));
+    } catch (ex) {
+      if (expired(ex)) { restart(ex.message); return; }
+      if (!applyLock(ex, pkBtn, err)) err.textContent = ex.message;
+    } finally { running = false; }
+  };
+  pkBtn.addEventListener('click', () => busy(pkBtn, tryPasskey, 'Warte auf Passkey …'));
+  showOverlay(pkBox, 'Anmelden');
+  pkBtn.focus();
+  busy(pkBtn, tryPasskey, 'Warte auf Passkey …');
 }
 
 const SETUP_CMD = (u) => `docker exec tandem /tandem-server admin setup ${u || '<kennung>'}`;
@@ -679,6 +820,7 @@ function showSetupStep2(code, r) {
     await busy(submit, async () => {
       try {
         const me = await api('setup/finish', { method: 'POST', noAuth: true, quiet: true, body: { code, totp: totp.value.trim() } });
+        if (me && me.user && me.user.id) writePref('login.user', me.user.id);
         setMe(me);
         hideOverlay();
         history.replaceState(null, '', location.pathname + location.search + '#/');
@@ -1314,6 +1456,7 @@ async function viewVaults() {
         return h('tr', { dataset: { key: s.id } },
           h('td', {},
             h('a', { class: 'row-link', href: `#/vault/${enc(s.id)}` }, nameWithId(s.name || s.id, s.id)),
+            e2eeBadge(s),
             h('div', { class: 'dim small show-sm', text: `${plural(st.docs, 'Datei', 'Dateien')} · ${st.updated ? fmtRel(st.updated) : 'noch nie geändert'}` })),
           h('td', {}, members.length
             ? h('span', { class: 'members-cell' }, memberChips(members, 3), h('a', { class: 'manage', href: `#/vault/${enc(s.id)}/_members`, 'aria-label': `Mitglieder von ${esc(s.name || s.id)} verwalten`, text: 'Verwalten' }))
@@ -1338,10 +1481,11 @@ async function viewVaults() {
 
 // Aktionen für einen ganzen Vault (Liste und Vault-Kopf)
 function vaultMenu(s, { onChange, onDelete } = {}) {
+  const plain = e2eeOf(s) === 'off';
   return [
     { label: 'Umbenennen …', onClick: () => renameVault(s, onChange) },
-    { label: 'Exportieren (.tar)', onClick: () => exportVault(s.id) },
-    { label: 'Aus Sicherung wiederherstellen …', onClick: () => navigate(`#/vault/${enc(s.id)}/_backups`) },
+    plain ? { label: 'Exportieren (.tar)', onClick: () => exportVault(s.id) } : null,
+    plain ? { label: 'Aus Sicherung wiederherstellen …', onClick: () => navigate(`#/vault/${enc(s.id)}/_backups`) } : null,
     '-',
     { label: 'Vault löschen …', danger: true, onClick: () => deleteVault(s, onDelete || (() => onChange && onChange(null))) },
   ];
@@ -1379,6 +1523,7 @@ async function newVaultDialog(existing) {
   const name = h('input', { class: 'input', id: 'nv-name', autocomplete: 'off', placeholder: 'z. B. Projekt Y' });
   const id = h('input', { class: 'input mono', id: 'nv-id', autocomplete: 'off', spellcheck: 'false', placeholder: 'z. B. projekt-y', 'aria-describedby': 'nv-id-hint nv-err' });
   const err = h('div', { class: 'form-error', id: 'nv-err', role: 'alert' });
+  const e2ee = h('input', { type: 'checkbox', id: 'nv-e2ee', 'aria-describedby': 'nv-e2ee-hint' });
   let idTouched = false;
   name.addEventListener('input', () => { if (!idTouched) id.value = slugify(name.value); err.textContent = ''; });
   id.addEventListener('input', () => { idTouched = id.value !== ''; err.textContent = ''; });
@@ -1387,6 +1532,9 @@ async function newVaultDialog(existing) {
     body: frag(
       h('div', { class: 'field' }, h('label', { for: 'nv-name', text: 'Name' }), name),
       h('div', { class: 'field' }, h('label', { for: 'nv-id', text: 'Kennung' }), id, h('span', { class: 'hint', id: 'nv-id-hint', text: 'a–z, 0–9, _ und -; wird in Obsidian als „Space“ eingetragen und lässt sich später nicht ändern.' })),
+      h('div', { class: 'field check' },
+        h('div', { class: 'field row' }, e2ee, h('label', { for: 'nv-e2ee', text: 'Ende-zu-Ende-verschlüsselt' })),
+        h('span', { class: 'hint', id: 'nv-e2ee-hint', text: 'Die Inhalte werden auf den Geräten verschlüsselt. Der Server und diese Oberfläche können Dateien dann weder lesen, durchsuchen, exportieren noch bearbeiten; die Lese-API (Lernplattform) steht für diesen Vault nicht zur Verfügung. Die Passphrase legt der Besitzer beim ersten Verbinden in Obsidian fest. Lässt sich nur beim Anlegen wählen.' })),
       err,
     ),
     buttons: [
@@ -1397,7 +1545,7 @@ async function newVaultDialog(existing) {
         if (!/^[a-z0-9_-]{1,64}$/.test(i)) { err.textContent = 'Kennung: nur a–z, 0–9, _ und -.'; id.focus(); return; }
         const dup = (existing || []).find((s) => s.id === i);
         if (dup) { err.textContent = `Die Kennung „${i}“ ist schon vergeben (Vault „${dup.name || dup.id}“).`; id.focus(); return; }
-        try { await api('spaces', { method: 'POST', body: { id: i, name: n }, quiet: true }); close(i); }
+        try { await api('spaces', { method: 'POST', body: e2ee.checked ? { id: i, name: n, e2ee: true } : { id: i, name: n }, quiet: true }); close(i); }
         catch (ex) { err.textContent = ex.status === 409 ? `Die Kennung „${i}“ ist schon vergeben.` : ex.message; }
       } },
     ],
@@ -1883,6 +2031,8 @@ const ACTION_LABELS = {
   'logout': ['Abgemeldet', 'security'],
   'admin.setup': ['Admin-Zugang eingerichtet', 'security'],
   'sessions.end': ['Sitzungen beendet', 'security'],
+  'passkey.add': ['Passkey hinzugefügt', 'security'],
+  'passkey.remove': ['Passkey entfernt', 'security'],
   'user.add': ['Person angelegt', 'people'],
   'user.edit': ['Person bearbeitet', 'people'],
   'user.delete': ['Person gelöscht', 'people'],
@@ -1894,6 +2044,7 @@ const ACTION_LABELS = {
   'space.add': ['Vault angelegt', 'vaults'],
   'space.rename': ['Vault umbenannt', 'vaults'],
   'space.delete': ['Vault gelöscht', 'vaults'],
+  'space.e2ee': ['Verschlüsselung eingerichtet', 'vaults'],
   'member.set': ['Rolle gesetzt', 'vaults'],
   'member.remove': ['Zugriff entzogen', 'vaults'],
   'file.create': ['Datei angelegt', 'files'],
@@ -1910,14 +2061,18 @@ const ACTION_LABELS = {
   'backup.restore': ['Aus Sicherung wiederhergestellt', 'backups'],
   'export': ['Vault exportiert', 'backups'],
 };
-const AUDIT_CATS = [['', 'Alle Bereiche', null], ['failed', 'Fehlgeschlagene Anmeldungen', ['login.failed']], ['security', 'Anmeldung & Sitzungen', ['login', 'logout', 'admin.', 'sessions.']], ['people', 'Personen & Geräte', ['user.', 'invite', 'device.']], ['vaults', 'Vaults & Mitglieder', ['space.', 'member.']], ['files', 'Dateien', ['file.']], ['backups', 'Sicherungen', ['backup.', 'export']]];
+const AUDIT_CATS = [['', 'Alle Bereiche', null], ['failed', 'Fehlgeschlagene Anmeldungen', ['login.failed']], ['security', 'Anmeldung & Sitzungen', ['login', 'logout', 'admin.', 'sessions.', 'passkey.']], ['people', 'Personen & Geräte', ['user.', 'invite', 'device.']], ['vaults', 'Vaults & Mitglieder', ['space.', 'member.']], ['files', 'Dateien', ['file.']], ['backups', 'Sicherungen', ['backup.', 'export']]];
 const AUDIT_PERIODS = [['', 'Gesamter Zeitraum', 0], ['1', 'Letzte 24 h', DAY], ['7', 'Letzte 7 Tage', 7 * DAY], ['30', 'Letzte 30 Tage', 30 * DAY]];
 
 // Details lesbar machen: Rollen übersetzen, Bytes formatieren, Nebensachen dimmen, Vault verlinken
 function auditDetail(r) {
   let d = typeof r.detail === 'string' ? r.detail : (r.detail == null ? '' : JSON.stringify(r.detail));
   const a = r.action;
-  if (a === 'login') return h('span', { title: d, text: uaLabel(d) });
+  if (a === 'login') {
+    // „<User-Agent> [Code|Passkey]“ – der zweite Faktor steht hinten in Klammern
+    const lm = d.match(/^([\s\S]*?)\s*\[(Code|Passkey)\]$/);
+    return h('span', { title: d }, uaLabel(lm ? lm[1] : d), lm ? h('span', { class: 'dim', text: ` · ${lm[2]}` }) : null);
+  }
   if (a === 'user.edit') {
     const m = d.match(/^(\S+) (\{.*\})$/);
     if (m) {
@@ -1945,7 +2100,7 @@ function auditDetail(r) {
     const mm = rest.match(/^(\S+) (in|aus) ([a-z0-9_-]+)(.*)$/);
     if (mm) out.push(personLabel(mm[1], { link: true }), ` ${mm[2]} `, h('a', { href: `#/vault/${enc(mm[3])}`, text: spaceName(mm[3]) }), mm[4]);
     else out.push(rest);
-  } else if ((a === 'space.add' || a === 'space.rename') && /^[a-z0-9_-]+/.test(rest)) {
+  } else if ((a === 'space.add' || a === 'space.rename' || a === 'space.e2ee') && /^[a-z0-9_-]+/.test(rest)) {
     const sm = rest.match(/^([a-z0-9_-]+)(.*)$/);
     out.push(h('a', { href: `#/vault/${enc(sm[1])}`, text: sm[1] }), sm[2]);
   } else if (a && a.startsWith('device.') && /^[0-9a-f]{12}/.test(rest)) {
@@ -2104,8 +2259,9 @@ async function viewAccount() {
   const box = h('div');
   const endBtn = h('button', { class: 'btn sm', type: 'button', text: 'Andere Sitzungen beenden' });
   const logoutBtn = h('button', { class: 'btn sm', type: 'button', text: 'Abmelden' });
+  const addKeyBtn = h('button', { class: 'btn sm', type: 'button', text: 'Passkey hinzufügen' });
   const load = loader(box, async () => {
-    const [me, list, ov] = await Promise.all([api('me', { quiet: true }), api('sessions', { quiet: true }), api('overview', { quiet: true }).catch(() => null)]);
+    const [me, list, ov, keysR] = await Promise.all([api('me', { quiet: true }), api('sessions', { quiet: true }), api('overview', { quiet: true }).catch(() => null), api('passkeys', { quiet: true }).catch((e) => e)]);
     if (me) setMe(me);
     const sessions = Array.isArray(list) ? list : [];
     const cur = sessions.find((s) => s.current);
@@ -2133,6 +2289,7 @@ async function viewAccount() {
             h('span', { title: esc(s.agent) }, uaLabel(s.agent), s.current ? h('span', { class: 'badge accent', text: 'diese Sitzung' }) : null),
             h('span', { class: 'dim small' }, 'zuletzt aktiv ', timeEl(s.lastSeen), ' · begonnen ', timeEl(s.created, { abs: true }),
               s.ip && s.ip !== 'direkt' ? frag(' · ', h('code', { text: s.ip })) : null)))))),
+      renderPasskeysCard(keysR, addKeyBtn, load),
       admins.length ? h('section', { class: 'card' },
         h('div', { class: 'card-head' }, h('h2', { text: `Admins (${fmtNum(admins.length)})` })),
         table(['Kennung', 'Eingerichtet', 'Letzte Anmeldung'], admins.map((a) => h('tr', {},
@@ -2141,6 +2298,7 @@ async function viewAccount() {
           h('td', {}, timeEl(a.lastLogin, { none: 'noch nie' })))), { caption: 'Admins' })) : null,
     );
   }, { what: 'Das Konto' });
+  addKeyBtn.addEventListener('click', () => addPasskey(addKeyBtn, load));
   endBtn.addEventListener('click', () => busy(endBtn, async () => {
     const r = await api('sessions/end-others', { method: 'POST' });
     const n = r && r.ended != null ? Number(r.ended) : 0;
@@ -2162,6 +2320,75 @@ async function viewAccount() {
   await loadUsers(true).catch(() => []);
   page('Konto', refreshButton(load), box);
   await load();
+}
+
+// Passkeys: zweiter Faktor statt des sechsstelligen Codes (der Code bleibt als Rückfall)
+function renderPasskeysCard(keysR, addBtn, reload) {
+  const supported = hasWebAuthn();
+  const keys = Array.isArray(keysR) ? keysR : [];
+  const failed = keysR instanceof Error ? keysR : null;
+  addBtn.hidden = !supported;
+  const intro = h('p', { class: 'card-body quiet small' },
+    'Ein Passkey ersetzt nach dem Passwort den Code aus der Authenticator-App – bestätigt per Fingerabdruck, Gesicht, Geräte-PIN oder Sicherheitsschlüssel. Der Code funktioniert weiterhin als Rückfall.');
+  let body;
+  if (failed) body = errorEl('Passkeys konnten nicht geladen werden', failed, reload);
+  else if (!supported) body = h('p', { class: 'card-body quiet', text: 'Dieser Browser unterstützt keine Passkeys. In einem aktuellen Browser lässt sich hier ein Passkey hinzufügen.' });
+  else if (!keys.length) body = emptyEl('Noch kein Passkey eingerichtet.');
+  else body = h('ul', { class: 'rows passkeys' }, keys.map((k) => {
+    const rm = h('button', { class: 'btn sm', type: 'button', text: 'Entfernen', 'aria-label': `Passkey „${esc(k.name)}“ entfernen` });
+    rm.addEventListener('click', async () => {
+      const ok = await confirmDialog('Passkey entfernen', h('p', {}, h('strong', { text: esc(k.name) }), ' wird entfernt. Danach gilt beim Anmelden wieder der Code aus der Authenticator-App.'), { okLabel: 'Entfernen', danger: true });
+      if (!ok) return;
+      await busy(rm, async () => {
+        await api(`passkeys/${enc(k.id)}`, { method: 'DELETE' });
+        toast('Passkey entfernt', 'ok');
+        await reload();
+      });
+    });
+    return h('li', { class: 'row2', dataset: { key: 'pk:' + k.id } },
+      h('div', { class: 'main' },
+        h('span', { text: esc(k.name) || 'Passkey' }),
+        h('span', { class: 'dim small' }, 'hinzugefügt ', timeEl(k.created, { abs: true }), ' · ', k.lastUsed ? frag('zuletzt benutzt ', timeEl(k.lastUsed)) : 'noch nie benutzt')),
+      h('div', { class: 'side' }, rm));
+  }));
+  return h('section', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', { text: keys.length ? `Passkeys (${fmtNum(keys.length)})` : 'Passkeys' }), addBtn),
+    intro, body);
+}
+
+async function addPasskey(btn, reload) {
+  const name = await promptDialog('Passkey hinzufügen', {
+    label: 'Name', value: 'Passkey', placeholder: 'z. B. Handy, YubiKey', okLabel: 'Weiter',
+    intro: 'Nach „Weiter“ fragt der Browser nach dem Passkey – z. B. Fingerabdruck, Gesicht, Geräte-PIN oder Sicherheitsschlüssel.',
+    validate: (v) => (v.length > 60 ? 'Höchstens 60 Zeichen.' : null),
+  });
+  if (name == null) return;
+  await busy(btn, async () => {
+    let o;
+    try { o = await api('passkeys/options', { method: 'POST', quiet: true }); } catch (ex) { toast(ex.message, 'error'); return; }
+    let cred;
+    try {
+      cred = await navigator.credentials.create({ publicKey: {
+        ...o,
+        challenge: b64urlToBuf(o.challenge),
+        user: { ...o.user, id: b64urlToBuf(o.user.id) },
+        excludeCredentials: (Array.isArray(o.excludeCredentials) ? o.excludeCredentials : []).map((c) => ({ type: c.type || 'public-key', id: b64urlToBuf(c.id) })),
+      } });
+    } catch (ex) {
+      if (ex && ex.name === 'NotAllowedError') return; // abgebrochen
+      if (ex && ex.name === 'InvalidStateError') toast('Dieser Passkey ist hier schon eingetragen.', 'error');
+      else toast(`Passkey nicht möglich: ${ex && ex.message ? ex.message : ex}`, 'error');
+      return;
+    }
+    try {
+      const r = await api('passkeys', { method: 'POST', quiet: true, body: { name: name || 'Passkey', credential: { response: {
+        clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+        attestationObject: bufToB64url(cred.response.attestationObject),
+      } } } });
+      toast(`Passkey „${esc(r && r.name) || name}“ hinzugefügt`, 'ok');
+    } catch (ex) { toast(ex.message, 'error'); return; }
+    await reload();
+  }, 'Warte auf Passkey …');
 }
 
 // ---------------------------------------------------------------------------
@@ -2212,10 +2439,13 @@ function createVaultCtx(space) {
     users: null,
     tab: '',
     notFound: false,
+    e2ee: 'off',      // 'off' | 'pending' | 'on' – aus GET spaces oder aus einer 409-Antwort
   };
+  const locked = () => ctx.e2ee !== 'off';
 
   // --- Grundgerüst
   const title = h('h1', { text: space });
+  const e2eeSlot = h('span', { class: 'e2ee-slot' });
   const tabLink = (tab, text) => h('a', { href: `#/vault/${enc(space)}${tab ? '/' + tab : ''}`, dataset: { tab } }, h('span', { text }), h('span', { class: 'n' }));
   const tabs = h('nav', { class: 'tabs', 'aria-label': 'Vault-Bereiche' },
     tabLink('', 'Dateien'), tabLink('_members', 'Mitglieder'), tabLink('_trash', 'Papierkorb'), tabLink('_backups', 'Sicherungen'));
@@ -2247,7 +2477,7 @@ function createVaultCtx(space) {
   const filePane = h('section', { class: 'file-pane', 'aria-label': 'Inhalt' });
   const membersPeek = h('a', { class: 'members-peek none', href: `#/vault/${enc(space)}/_members`, hidden: true, text: 'Niemand hat Zugriff' });
   const head = h('div', { class: 'vault-head' },
-    h('div', { class: 'vh-title' }, h('span', { class: 'crumb' }, h('a', { href: '#/vaults', text: 'Vaults' }), h('span', { 'aria-hidden': 'true', text: ' / ' })), title, membersPeek),
+    h('div', { class: 'vh-title' }, h('span', { class: 'crumb' }, h('a', { href: '#/vaults', text: 'Vaults' }), h('span', { 'aria-hidden': 'true', text: ' / ' })), title, e2eeSlot, membersPeek),
     tabs, toolbar);
   const root = h('div', { class: 'vault' }, head, h('div', { class: 'vault-body' }, treePane, backdrop, filePane));
   ctx.root = root;
@@ -2291,6 +2521,8 @@ function createVaultCtx(space) {
     } catch (e) { ctx.infoError = e; }
     title.textContent = ctx.info && ctx.info.name ? ctx.info.name : space;
     title.title = `Kennung: ${space}`;
+    if (ctx.info) ctx.e2ee = e2eeOf(ctx.info);
+    replace(e2eeSlot, e2eeBadge({ e2ee: ctx.e2ee }));
     updateTitle();
     renderHeadState();
   };
@@ -2319,11 +2551,15 @@ function createVaultCtx(space) {
       const n = counts[a.dataset.tab];
       a.querySelector('.n').textContent = n != null && n > 0 ? String(n) : '';
     }
-    const disabled = !ctx.info || !!ctx.filesError;
+    const disabled = !ctx.info || !!ctx.filesError || locked();
     newBtn.disabled = disabled; upBtn.disabled = disabled;
+    // Verschlüsselt: kein Baum, keine Datei-Aktionen
+    root.classList.toggle('no-tree', ctx.tab !== '' || locked());
+    if (locked()) { newBtn.hidden = upBtn.hidden = true; toggleDrawer(false); }
   }
   ctx.loadFiles = async () => {
     try {
+      if (locked()) throw new ApiError(409, { error: 'Ende-zu-Ende-verschlüsselt' });
       const r = await api(`spaces/${enc(space)}/files`, { quiet: true });
       ctx.files = r && Array.isArray(r.files) ? r.files : [];
       ctx.online = r && Array.isArray(r.online) ? r.online : [];
@@ -2331,8 +2567,15 @@ function createVaultCtx(space) {
       ctx.filesLoaded = true;
       setStamp(true, stamp);
     } catch (e) {
-      ctx.filesError = e;
-      setStamp(false, stamp);
+      if (isE2eeErr(e)) {
+        // Inhalte sind verborgen – kein Fehler, sondern ein leerer, gesperrter Stand
+        if (ctx.e2ee === 'off') ctx.e2ee = 'on';
+        ctx.files = []; ctx.online = []; ctx.filesError = null; ctx.filesLoaded = true; ctx.search = null;
+        setStamp(true, stamp);
+      } else {
+        ctx.filesError = e;
+        setStamp(false, stamp);
+      }
     }
     renderHeadState();
     if (ctx.tab === '') renderTree();
@@ -2372,13 +2615,20 @@ function createVaultCtx(space) {
     }
     // „Dateien“ führt zur zuletzt offenen Datei zurück
     tabs.children[0].href = `#/vault/${enc(space)}${ctx.doc ? '/' + enc(ctx.doc.id) : ''}`;
-    root.classList.toggle('no-tree', ctx.tab !== '');
-    newBtn.hidden = upBtn.hidden = ctx.tab !== '';
-    if (ctx.tab !== '') toggleDrawer(false);
+    root.classList.toggle('no-tree', ctx.tab !== '' || locked());
+    newBtn.hidden = upBtn.hidden = ctx.tab !== '' || locked();
+    if (ctx.tab !== '' || locked()) toggleDrawer(false);
     updateTitle();
     if (ctx.tab === '_members') { await renderMembers(); return; }
     if (ctx.tab === '_trash') { renderTrash(); return; }
     if (ctx.tab === '_backups') { await renderBackupsTab(); return; }
+    if (sub && locked()) {
+      // Datei-Links in einen verschlüsselten Vault führen zum Hinweis (Adresse ohne Dateiteil)
+      const to = `#/vault/${enc(space)}`;
+      history.replaceState(null, '', location.pathname + location.search + to);
+      state.hash = to;
+      sub = '';
+    }
     if (!sub) { ctx.stash = null; closeEditor(); renderEmptyPane(); renderTree(); updateTitle(); return; }
     if (ctx.stash && ctx.doc && ctx.doc.id === sub) {
       replace(filePane, ctx.stash);
@@ -2402,6 +2652,8 @@ function createVaultCtx(space) {
 
   function renderEmptyPane() {
     clear(filePane);
+    if (locked()) { filePane.append(h('div', { class: 'file-body center' }, e2eeNotice(ctx.e2ee, ctx.info && !members().length
+      ? h('p', { class: 'warn-note' }, 'Noch niemand hat Zugriff auf diesen Vault. ', h('a', { href: `#/vault/${enc(space)}/_members`, text: 'Mitglieder hinzufügen' })) : null))); return; }
     if (ctx.filesError) { filePane.append(h('div', { class: 'file-body center' }, errorEl('Dateien konnten nicht geladen werden', ctx.filesError, () => ctx.reload()))); return; }
     if (!ctx.filesLoaded) { filePane.append(loadingEl()); return; }
     const files = liveFiles();
@@ -2435,6 +2687,7 @@ function createVaultCtx(space) {
   }
 
   function renderTree() {
+    if (locked()) { ctx.search = null; clear(treeScroll); return; }
     if (ctx.search) { renderSearch(); return; }
     clear(treeScroll);
     if (ctx.filesError) { treeScroll.append(errorEl('Dateien konnten nicht geladen werden', ctx.filesError, () => ctx.reload())); return; }
@@ -3336,6 +3589,7 @@ function createVaultCtx(space) {
 
   // --- Papierkorb (nach Ordner gruppiert)
   function renderTrash() {
+    if (locked()) { replace(filePane, h('div', { class: 'page' }, e2eeNotice(ctx.e2ee))); return; }
     if (ctx.filesError) { replace(filePane, h('div', { class: 'page' }, errorEl('Papierkorb konnte nicht geladen werden', ctx.filesError, () => ctx.reload()))); return; }
     if (!ctx.filesLoaded) { replace(filePane, loadingEl()); return; }
     const gone = ctx.files.filter((f) => f && f.del && typeof f.path === 'string').sort((a, b) => coll.compare(a.path, b.path));
@@ -3419,6 +3673,11 @@ function createVaultCtx(space) {
 
   // --- Sicherungen (Export und Einstieg in die Wiederherstellung)
   async function renderBackupsTab() {
+    if (locked()) {
+      replace(filePane, h('div', { class: 'page' }, e2eeNotice(ctx.e2ee,
+        h('p', { class: 'small' }, 'Die Sicherungen der ganzen Datenbank enthalten diesen Vault weiterhin (verschlüsselt). ', h('a', { href: '#/backups', text: 'Zu den Sicherungen' })))));
+      return;
+    }
     const box = h('div');
     const exportBtn = h('button', { class: 'btn', type: 'button', text: 'Heutigen Stand exportieren (.tar)', onclick: () => exportVault(space) });
     replace(filePane, h('div', { class: 'page' },
@@ -4831,6 +5090,14 @@ function createBackupCtx(name) {
       [r, sp, live] = await Promise.all([api('backups', { quiet: true }), api(`backups/${enc(name)}/spaces`, { quiet: true, expect: [404] }), loadSpaces(false).catch(() => [])]);
     } catch (e) {
       if (e.status === 404) { notFound(); return; }
+      if (isE2eeErr(e)) {
+        ctx.info = null;
+        try { r = await api('backups', { quiet: true }); ctx.info = (r && Array.isArray(r.backups) ? r.backups : []).find((b) => b.name === name) || null; } catch { /* Kopf bleibt schlicht */ }
+        if (ctx.info) { ctx.all = r.backups; renderHead(); }
+        bodyEl.hidden = true; selbar.hidden = true;
+        replace(tabsBox, e2eeNotice('on', h('p', {}, 'Diese Sicherung enthält einen Ende-zu-Ende-verschlüsselten Vault; ihre Inhalte lassen sich hier nicht durchsehen. Herunterladen (.db) und Löschen sind weiterhin möglich.')));
+        return;
+      }
       replace(tabsBox, errorEl('Sicherung konnte nicht geöffnet werden', e, () => ctx.init(space, doc)));
       return;
     }
@@ -4869,14 +5136,14 @@ function createBackupCtx(name) {
     const later = ctx.live.filter((l) => !ctx.spaces.some((s) => s.id === l.id));
     const items = ctx.spaces.map((s) => ({ s, deleted: !ctx.live.some((l) => l.id === s.id) }));
     if (items.length + later.length >= 6) {
-      const sel = h('select', { class: 'select', id: 'bk-space' }, items.map(({ s, deleted }) => h('option', { value: s.id, text: `${esc(s.name || s.id)} (${fmtNum(s.files)})${deleted ? ' – heute gelöscht' : ''}` })));
+      const sel = h('select', { class: 'select', id: 'bk-space' }, items.map(({ s, deleted }) => h('option', { value: s.id, text: `${esc(s.name || s.id)} (${s.files == null ? 'verschlüsselt' : fmtNum(s.files)})${deleted ? ' – heute gelöscht' : ''}` })));
       sel.value = ctx.space || '';
       sel.addEventListener('change', () => navigate(path(sel.value)));
       replace(tabsBox, h('div', { class: 'field row' }, h('label', { for: 'bk-space', text: 'Vault' }), sel));
       return;
     }
     replace(tabsBox, h('nav', { class: 'tabs', 'aria-label': 'Vault in der Sicherung' },
-      items.map(({ s, deleted }) => h('a', { href: path(s.id), 'aria-current': s.id === ctx.space ? 'page' : null }, esc(s.name || s.id), ' ', h('span', { class: 'n', text: fmtNum(s.files) }), deleted ? h('span', { class: 'badge warn', text: 'gelöscht' }) : null)),
+      items.map(({ s, deleted }) => h('a', { href: path(s.id), 'aria-current': s.id === ctx.space ? 'page' : null }, esc(s.name || s.id), ' ', s.files == null ? null : h('span', { class: 'n', text: fmtNum(s.files) }), deleted ? h('span', { class: 'badge warn', text: 'gelöscht' }) : null, s.e2ee || spaceE2ee(s.id) !== 'off' ? h('span', { class: 'badge e2ee', text: 'verschlüsselt' }) : null)),
       later.map((l) => h('span', { class: 'tab-disabled', 'aria-disabled': 'true', title: 'Gab es zum Zeitpunkt der Sicherung noch nicht' }, esc(l.name || l.id), ' ', h('span', { class: 'dim small', text: 'später angelegt' })))));
   }
 
@@ -4918,8 +5185,15 @@ function createBackupCtx(name) {
       ctx.online = files && Array.isArray(files.online) ? files.online : [];
       ctx.liveFiles = files && Array.isArray(files.files) ? files.files : [];
       listBox.dataset.space = ctx.space;
+      bodyEl.classList.remove('e2ee');
     } catch (e) {
       if (e.status === 404) { notFound(); return; }
+      if (isE2eeErr(e)) {
+        ctx.data = null; clear(toolsBox); clear(previewBox); clear(resultBox);
+        bodyEl.classList.add('e2ee');
+        replace(listBox, e2eeNotice(spaceE2ee(ctx.space) === 'pending' ? 'pending' : 'on'));
+        return;
+      }
       replace(listBox, errorEl('Dateien konnten nicht geladen werden', e, loadFiles));
       return;
     } finally { listBox.classList.remove('reloading'); listBox.removeAttribute('aria-busy'); }

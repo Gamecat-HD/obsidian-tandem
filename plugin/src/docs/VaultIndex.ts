@@ -16,6 +16,8 @@ export interface IndexEntry {
 	size?: number;
 	/** blob: Hash der Fassung, von der diese abgeleitet wurde (Erkennung gleichzeitiger Änderungen). */
 	parent?: string;
+	/** blob in verschlüsselten Spaces: Adresse auf dem Server = SHA-256 des Chiffretexts. */
+	ehash?: string;
 	del?: boolean;
 	/** Nutzer-ID der letzten Änderung am Eintrag */
 	by?: string;

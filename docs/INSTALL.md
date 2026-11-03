@@ -214,7 +214,9 @@ Den Link öffnen, Passwort festlegen, QR-Code scannen, fertig. Derselbe Befehl s
 docker compose up -d --force-recreate
 ```
 
-Das Plugin aktualisiert BRAT automatisch, sonst die drei Dateien aus dem neuen Release in `.obsidian/plugins/tandem/` ersetzen. `data.json` dabei **nicht** überschreiben, darin stehen Server und Space.
+Ab 0.5.0: Einstellungen → Tandem → **Version** → „Nach Updates suchen“ bzw. „Aktualisieren“ (Befehl „Tandem: Nach Updates suchen“). Tandem lädt die drei Dateien aus dem neuesten GitHub-Release, prüft sie gegen `SHA256SUMS` und lädt sich neu. Einmal am Tag meldet es von selbst, wenn es etwas Neues gibt. Jedes Gerät aktualisiert sich selbst (`.obsidian/` wird nicht synchronisiert). Alternativ BRAT oder die drei Dateien aus dem Release von Hand in `.obsidian/plugins/tandem/` ersetzen. `data.json` dabei **nicht** überschreiben, darin stehen Server und Space.
+
+Server und Plugin am besten gemeinsam aktualisieren (siehe [CHANGELOG](../CHANGELOG.md)).
 
 Wer per Portainer-API deployt: [`deploy/redeploy.sh`](../deploy/redeploy.sh) baut den Binary, baut das Image auf dem Server und tauscht den Container aus. Bleibt der neue Container nicht „healthy“, kommt automatisch der alte zurück. Einstellungen in `deploy/local.env` (Vorlage: [`local.env.example`](../deploy/local.env.example)).
 

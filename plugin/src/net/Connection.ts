@@ -12,6 +12,10 @@ export interface DocHandler {
 	onSync(sub: number, data: Uint8Array): void;
 	onAwareness(data: Uint8Array): void;
 	onError?(code: number, message: string): void;
+	/** Verschlüsselte Spaces */
+	onELog?(total: number, rows: { id: number; data: Uint8Array }[]): void;
+	onEUpd?(id: number, data: Uint8Array): void;
+	onEAck?(id: number): void;
 }
 
 export interface ConnectionOptions {
@@ -153,6 +157,15 @@ export class Connection {
 				break;
 			case Msg.Awareness:
 				this.handlers.get(f.doc)?.onAwareness(f.data);
+				break;
+			case Msg.ELog:
+				this.handlers.get(f.doc)?.onELog?.(f.total, f.rows);
+				break;
+			case Msg.EUpd:
+				this.handlers.get(f.doc)?.onEUpd?.(f.id, f.data);
+				break;
+			case Msg.EAck:
+				this.handlers.get(f.doc)?.onEAck?.(f.id);
 				break;
 			case Msg.Changes:
 				for (const fn of this.changesListeners) fn(f.space, f.seq, f.docs);

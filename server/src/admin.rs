@@ -10,6 +10,7 @@ use crate::db::{self, User, now, sha256_hex};
 use crate::hub::HubError;
 use crate::server::{App, client_ip};
 use crate::vault::{self, Entry};
+use crate::webauthn;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
@@ -39,9 +40,22 @@ connect-src 'self'; frame-src 'self'; font-src 'self'; frame-ancestors 'none'; b
 pub(crate) const RAW_CSP: &str = "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'";
 const MAX_TEXT: usize = 5 << 20;
 
+/// Zwischenstand nach richtigem Passwort: wartet auf den zweiten Faktor.
+struct Ticket {
+    user: String,
+    expires: Instant,
+    tries: u32,
+    /// WebAuthn-Challenge für die Anmeldung per Passkey
+    challenge: Vec<u8>,
+}
+
 pub struct AdminState {
     /// IP → (Fehlversuche, Beginn des Fensters)
     fails: Mutex<HashMap<String, (u32, Instant)>>,
+    /// sha256(Ticket) → Zwischenstand der Anmeldung (5 min, höchstens 5 Versuche)
+    tickets: Mutex<HashMap<String, Ticket>>,
+    /// Sitzungs-ID → Challenge zum Einrichten eines Passkeys (5 min)
+    reg: Mutex<HashMap<String, (Vec<u8>, Instant)>>,
     /// Argon2 braucht ~19 MiB pro Lauf – nie mehrere gleichzeitig (128-MiB-Container).
     argon: Semaphore,
     /// Entwicklung: UI-Dateien bei jeder Anfrage von hier lesen statt eingebettet.
@@ -52,6 +66,8 @@ impl AdminState {
     pub fn new() -> Self {
         Self {
             fails: Mutex::default(),
+            tickets: Mutex::default(),
+            reg: Mutex::default(),
             argon: Semaphore::new(1),
             ui_dir: std::env::var_os("TANDEM_ADMIN_UI_DIR").map(Into::into),
         }
@@ -67,6 +83,11 @@ pub fn router() -> Router<App> {
         .route("/me", get(me))
         // Ohne Anmeldung erreichbar → kleine Bodies (der globale Grenzwert ist 100 MiB für Anhänge).
         .route("/login", post(login).layer(DefaultBodyLimit::max(16 << 10)))
+        .route("/login/totp", post(login_totp).layer(DefaultBodyLimit::max(16 << 10)))
+        .route("/login/passkey", post(login_passkey).layer(DefaultBodyLimit::max(16 << 10)))
+        .route("/passkeys", get(passkeys_list).post(passkey_add))
+        .route("/passkeys/options", post(passkey_options))
+        .route("/passkeys/{id}", axum::routing::delete(passkey_remove))
         .route("/logout", post(logout))
         .route("/setup/start", post(setup_start).layer(DefaultBodyLimit::max(16 << 10)))
         .route("/setup/finish", post(setup_finish).layer(DefaultBodyLimit::max(16 << 10)))
@@ -226,6 +247,7 @@ impl From<HubError> for E {
     fn from(e: HubError) -> Self {
         match e {
             HubError::Forbidden => E(StatusCode::FORBIDDEN, "kein Zugriff".into()),
+            HubError::E2ee => E(StatusCode::CONFLICT, "Dieser Vault ist Ende-zu-Ende-verschlüsselt – Inhalte sind nur in Obsidian lesbar".into()),
             HubError::BadRequest(m) => E(StatusCode::BAD_REQUEST, m.into()),
             HubError::Internal(m) => {
                 tracing::warn!("Admin: interner Fehler: {m}");
@@ -325,60 +347,276 @@ async fn me(State(app): State<App>, h: HeaderMap) -> R {
 struct LoginReq {
     user: String,
     password: String,
-    totp: String,
 }
 
+const TICKET_TTL: Duration = Duration::from_secs(5 * 60);
+const TICKET_TRIES: u32 = 5;
+
+fn login_failed(app: &App, ip: &str, uid: &str, why: &str) -> E {
+    ip_failed(app, ip);
+    let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
+    st.audit(uid, ip, "login.failed", why);
+    tracing::warn!(user = uid, ip, why, "Admin-Anmeldung fehlgeschlagen");
+    E(StatusCode::UNAUTHORIZED, "Anmeldung fehlgeschlagen: Kennung oder Passwort stimmt nicht.".into())
+}
+
+fn locked(cred_locked_until: i64) -> Option<E> {
+    (cred_locked_until > now()).then(|| {
+        let mins = ((cred_locked_until - now()) as f64 / 60.0).ceil().max(1.0) as i64;
+        E(StatusCode::TOO_MANY_REQUESTS, format!("Zu viele Fehlversuche – bitte in {mins} min erneut versuchen"))
+    })
+}
+
+fn rp(h: &HeaderMap) -> webauthn::Rp {
+    let host = h.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("localhost");
+    webauthn::Rp::from(std::env::var("TANDEM_PUBLIC_URL").ok().as_deref().filter(|u| !u.is_empty()), host)
+}
+
+/// Schritt 1: Kennung + Passwort. Bei Erfolg gibt es ein kurzlebiges Ticket für den zweiten Faktor
+/// (TOTP-Code oder Passkey) – noch keine Sitzung.
 async fn login(State(app): State<App>, h: HeaderMap, Json(req): Json<LoginReq>) -> R {
     let ip = client_ip(&h);
     if ip_blocked(&app, &ip) {
         return Err(E(StatusCode::TOO_MANY_REQUESTS, "Zu viele Fehlversuche – bitte später erneut versuchen".into()));
     }
     let uid = req.user.trim().to_lowercase();
-    let fail = |app: &App, uid: &str, why: &str| {
-        ip_failed(app, &ip);
-        let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
-        st.audit(uid, &ip, "login.failed", why);
-        tracing::warn!(user = uid, ip, why, "Admin-Anmeldung fehlgeschlagen");
-        E(
-            StatusCode::UNAUTHORIZED,
-            "Anmeldung fehlgeschlagen: Kennung, Passwort oder Code stimmt nicht. Jeder Code gilt nur einmal – falls du ihn gerade schon benutzt hast, den nächsten abwarten."
-                .into(),
-        )
-    };
     if req.password.len() > 1024 || uid.len() > 64 {
-        return Err(fail(&app, &uid, "Eingabe zu lang"));
+        return Err(login_failed(&app, &ip, &uid, "Eingabe zu lang"));
     }
     let cred = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).admin_cred(&uid)?;
     let Some(cred) = cred else {
         // Gleiche Arbeit wie bei einem echten Konto, damit die Antwortzeit nichts verrät.
         argon_verify(&app, req.password, auth::DUMMY_HASH.clone()).await?;
-        return Err(fail(&app, &uid, "unbekannte Kennung"));
+        return Err(login_failed(&app, &ip, &uid, "unbekannte Kennung"));
     };
-    if cred.locked_until > now() {
+    if let Some(e) = locked(cred.locked_until) {
         ip_failed(&app, &ip);
-        let mins = ((cred.locked_until - now()) as f64 / 60.0).ceil().max(1.0) as i64;
-        return Err(E(StatusCode::TOO_MANY_REQUESTS, format!("Zu viele Fehlversuche – bitte in {mins} min erneut versuchen")));
+        return Err(e);
     }
-    let pw_ok = argon_verify(&app, req.password, cred.pw_hash.clone()).await?;
-    let step = auth::verify_totp(&cred.totp_secret, &req.totp, cred.totp_last, now());
-    let (true, Some(step)) = (pw_ok, step) else {
+    if !argon_verify(&app, req.password, cred.pw_hash.clone()).await? {
         let _ = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).admin_login_failed(&cred.user_id);
-        return Err(fail(&app, &uid, if pw_ok { "Code falsch" } else { "Passwort falsch" }));
-    };
+        return Err(login_failed(&app, &ip, &uid, "Passwort falsch"));
+    }
+    let ticket = crate::db::random_token(32);
+    let challenge = webauthn::challenge();
+    let keys = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).passkeys(&cred.user_id)?;
+    {
+        let mut t = app.admin.tickets.lock().unwrap_or_else(|e| e.into_inner());
+        let now_i = Instant::now();
+        t.retain(|_, v| v.expires > now_i);
+        t.insert(sha256_hex(ticket.as_bytes()), Ticket { user: cred.user_id.clone(), expires: now_i + TICKET_TTL, tries: 0, challenge: challenge.clone() });
+    }
+    let passkey = (!keys.is_empty()).then(|| {
+        json!({
+            "challenge": webauthn::b64url(&challenge),
+            "rpId": rp(&h).id,
+            "timeout": 120000,
+            "userVerification": "required",
+            "allowCredentials": keys.iter().map(|k| json!({ "type": "public-key", "id": k.0 })).collect::<Vec<_>>(),
+        })
+    });
+    let mut methods = vec!["totp"];
+    if passkey.is_some() {
+        methods.insert(0, "passkey");
+    }
+    Ok(Json(json!({ "ticket": ticket, "methods": methods, "passkey": passkey })).into_response())
+}
+
+/// Ticket nachschlagen (ohne es zu verbrauchen). Ungültig/abgelaufen → 401, Schritt 1 wiederholen.
+fn ticket_user(app: &App, ticket: &str) -> Result<(String, String, Vec<u8>), E> {
+    let key = sha256_hex(ticket.as_bytes());
+    let t = app.admin.tickets.lock().unwrap_or_else(|e| e.into_inner());
+    match t.get(&key) {
+        Some(v) if v.expires > Instant::now() => Ok((key, v.user.clone(), v.challenge.clone())),
+        _ => Err(E(StatusCode::UNAUTHORIZED, "Anmeldung abgelaufen – bitte noch einmal mit Passwort anmelden".into())),
+    }
+}
+
+/// Fehlversuch im zweiten Schritt: zählt fürs Konto und die IP; nach 5 Versuchen ist das Ticket verbraucht.
+fn second_factor_failed(app: &App, ip: &str, key: &str, uid: &str, why: &str) -> E {
+    {
+        let mut t = app.admin.tickets.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = t.get_mut(key) {
+            v.tries += 1;
+            if v.tries >= TICKET_TRIES {
+                t.remove(key);
+            }
+        }
+    }
+    ip_failed(app, ip);
+    let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = st.admin_login_failed(uid);
+    st.audit(uid, ip, "login.failed", why);
+    tracing::warn!(user = uid, ip, why, "Admin-Anmeldung (2. Faktor) fehlgeschlagen");
+    E(StatusCode::UNAUTHORIZED, format!("{why}."))
+}
+
+/// Ticket verbrauchen und die Sitzung anlegen.
+fn finish_login(app: &App, h: &HeaderMap, key: &str, uid: &str, ip: &str, how: &str) -> R {
+    app.admin.tickets.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
     let agent = h.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let token = {
-        let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
-        st.admin_login_ok(&cred.user_id, step)?;
-        st.create_session(&cred.user_id, &ip, agent)?
-    };
+    let token = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).create_session(uid, ip, agent)?;
     let mut hh = HeaderMap::new();
     hh.insert(header::COOKIE, HeaderValue::from_str(&format!("{COOKIE}={token}")).unwrap());
-    let c = ctx(&app, &hh).map(|mut c| {
-        c.ip = ip.clone();
-        c
-    })?;
-    audit(&app, &c, "login", agent);
+    let mut c = ctx(app, &hh)?;
+    c.ip = ip.to_string();
+    audit(app, &c, "login", format!("{agent} [{how}]"));
     Ok(([(header::SET_COOKIE, session_cookie(&token))], Json(me_json(&c))).into_response())
+}
+
+#[derive(Deserialize)]
+struct TotpReq {
+    ticket: String,
+    code: String,
+}
+
+/// Schritt 2a: sechsstelliger Code aus der Authenticator-App.
+async fn login_totp(State(app): State<App>, h: HeaderMap, Json(req): Json<TotpReq>) -> R {
+    let ip = client_ip(&h);
+    if ip_blocked(&app, &ip) {
+        return Err(E(StatusCode::TOO_MANY_REQUESTS, "Zu viele Fehlversuche – bitte später erneut versuchen".into()));
+    }
+    let (key, uid, _) = ticket_user(&app, &req.ticket)?;
+    let cred = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).admin_cred(&uid)?.ok_or_else(|| E(StatusCode::UNAUTHORIZED, "Zugang nicht mehr vorhanden".into()))?;
+    if let Some(e) = locked(cred.locked_until) {
+        return Err(e);
+    }
+    let Some(step) = auth::verify_totp(&cred.totp_secret, &req.code, cred.totp_last, now()) else {
+        return Err(second_factor_failed(&app, &ip, &key, &uid, "Code stimmt nicht – jeder Code gilt nur einmal, ggf. den nächsten abwarten"));
+    };
+    // Bedingt speichern: zwei gleichzeitige Anmeldungen mit demselben Code → nur eine gewinnt.
+    if !app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).admin_login_ok(&uid, Some(step))? {
+        return Err(second_factor_failed(&app, &ip, &key, &uid, "Code wurde gerade schon benutzt – den nächsten abwarten"));
+    }
+    finish_login(&app, &h, &key, &uid, &ip, "Code")
+}
+
+#[derive(Deserialize)]
+struct AssertionResp {
+    #[serde(rename = "clientDataJSON")]
+    client_data: String,
+    #[serde(rename = "authenticatorData")]
+    auth_data: String,
+    signature: String,
+}
+
+#[derive(Deserialize)]
+struct Assertion {
+    id: String,
+    response: AssertionResp,
+}
+
+#[derive(Deserialize)]
+struct PasskeyLoginReq {
+    ticket: String,
+    credential: Assertion,
+}
+
+/// Schritt 2b: Passkey (WebAuthn-Assertion zur Challenge aus Schritt 1).
+async fn login_passkey(State(app): State<App>, h: HeaderMap, Json(req): Json<PasskeyLoginReq>) -> R {
+    let ip = client_ip(&h);
+    if ip_blocked(&app, &ip) {
+        return Err(E(StatusCode::TOO_MANY_REQUESTS, "Zu viele Fehlversuche – bitte später erneut versuchen".into()));
+    }
+    let (key, uid, challenge) = ticket_user(&app, &req.ticket)?;
+    let cred = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).admin_cred(&uid)?.ok_or_else(|| E(StatusCode::UNAUTHORIZED, "Zugang nicht mehr vorhanden".into()))?;
+    if let Some(e) = locked(cred.locked_until) {
+        return Err(e);
+    }
+    let a = &req.credential;
+    let pk = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).passkey(&uid, &a.id)?;
+    let Some((cose, count)) = pk else {
+        return Err(second_factor_failed(&app, &ip, &key, &uid, "Dieser Passkey gehört nicht zu deinem Zugang"));
+    };
+    let dec = |s: &str| webauthn::b64url_decode(s).ok_or_else(|| bad("Passkey-Antwort nicht lesbar"));
+    let (cd, ad, sig) = (dec(&a.response.client_data)?, dec(&a.response.auth_data)?, dec(&a.response.signature)?);
+    let new_count = match webauthn::verify(&cose, count, &cd, &ad, &sig, &challenge, &rp(&h)) {
+        Ok(n) => n,
+        Err(e) => return Err(second_factor_failed(&app, &ip, &key, &uid, &format!("Passkey abgelehnt: {e}"))),
+    };
+    {
+        let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.passkey_used(&a.id, new_count)?;
+        st.admin_login_ok(&uid, None)?;
+    }
+    finish_login(&app, &h, &key, &uid, &ip, "Passkey")
+}
+
+// ── Passkeys verwalten (angemeldet) ──────────────────────────────────
+
+async fn passkeys_list(State(app): State<App>, h: HeaderMap) -> R {
+    let c = ctx(&app, &h)?;
+    let list = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).passkeys(&c.user.id)?;
+    Ok(Json(list.into_iter().map(|(id, name, created, last)| json!({ "id": id, "name": name, "created": created, "lastUsed": last })).collect::<Vec<_>>()).into_response())
+}
+
+/// Optionen für `navigator.credentials.create()`.
+async fn passkey_options(State(app): State<App>, h: HeaderMap) -> R {
+    let c = ctx(&app, &h)?;
+    let challenge = webauthn::challenge();
+    {
+        let mut r = app.admin.reg.lock().unwrap_or_else(|e| e.into_inner());
+        let now_i = Instant::now();
+        r.retain(|_, v| v.1 > now_i);
+        r.insert(c.sid.clone(), (challenge.clone(), now_i + TICKET_TTL));
+    }
+    let existing = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).passkeys(&c.user.id)?;
+    let rp = rp(&h);
+    let params: Vec<Value> = [webauthn::ES256, webauthn::EDDSA, webauthn::RS256].iter().map(|a| json!({ "type": "public-key", "alg": a })).collect();
+    Ok(Json(json!({
+        "challenge": webauthn::b64url(&challenge),
+        "rp": { "id": rp.id, "name": "Tandem" },
+        "user": { "id": webauthn::b64url(format!("tandem-admin:{}", c.user.id).as_bytes()), "name": c.user.id, "displayName": c.user.name },
+        "pubKeyCredParams": params,
+        "excludeCredentials": existing.iter().map(|k| json!({ "type": "public-key", "id": k.0 })).collect::<Vec<_>>(),
+        "authenticatorSelection": { "residentKey": "preferred", "userVerification": "required" },
+        "attestation": "none",
+        "timeout": 120000,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct AttestationResp {
+    #[serde(rename = "clientDataJSON")]
+    client_data: String,
+    #[serde(rename = "attestationObject")]
+    attestation: String,
+}
+
+#[derive(Deserialize)]
+struct Attestation {
+    response: AttestationResp,
+}
+
+#[derive(Deserialize)]
+struct PasskeyAdd {
+    name: String,
+    credential: Attestation,
+}
+
+async fn passkey_add(State(app): State<App>, h: HeaderMap, Json(req): Json<PasskeyAdd>) -> R {
+    let c = ctx(&app, &h)?;
+    let challenge = app.admin.reg.lock().unwrap_or_else(|e| e.into_inner()).remove(&c.sid).filter(|v| v.1 > Instant::now()).map(|v| v.0);
+    let Some(challenge) = challenge else { return Err(bad("Einrichtung abgelaufen – bitte erneut starten")) };
+    let dec = |s: &str| webauthn::b64url_decode(s).ok_or_else(|| bad("Passkey-Antwort nicht lesbar"));
+    let nc = webauthn::register(&dec(&req.credential.response.client_data)?, &dec(&req.credential.response.attestation)?, &challenge, &rp(&h))
+        .map_err(|e| bad(format!("Passkey abgelehnt: {e}")))?;
+    let name = req.name.trim().chars().take(60).collect::<String>();
+    let name = if name.is_empty() { "Passkey".to_string() } else { name };
+    let id = webauthn::b64url(&nc.id);
+    app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).add_passkey(&c.user.id, &id, &name, &nc.cose, nc.alg, nc.count)?;
+    audit(&app, &c, "passkey.add", &name);
+    Ok(Json(json!({ "id": id, "name": name })).into_response())
+}
+
+async fn passkey_remove(State(app): State<App>, h: HeaderMap, Path(id): Path<String>) -> R {
+    let c = ctx(&app, &h)?;
+    if !app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).remove_passkey(&c.user.id, &id)? {
+        return Err(not_found("Passkey nicht gefunden"));
+    }
+    audit(&app, &c, "passkey.remove", &id);
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn logout(State(app): State<App>, h: HeaderMap) -> R {
@@ -839,7 +1077,12 @@ async fn spaces(State(app): State<App>, h: HeaderMap) -> R {
             .into_iter()
             .map(|m| json!({ "id": m["id"], "name": m["name"], "color": m["color"], "role": m["role"] }))
             .collect();
-        out.push(json!({ "id": id, "name": name, "seq": seq, "members": members, "stats": st.space_stats(&id)?, "online": online }));
+        let e2ee = match st.space_e2ee(&id)?.as_deref() {
+            None => "off",
+            Some(crate::db::E2EE_PENDING) => "pending",
+            Some(_) => "on",
+        };
+        out.push(json!({ "id": id, "name": name, "seq": seq, "members": members, "stats": st.space_stats(&id)?, "online": online, "e2ee": e2ee }));
     }
     Ok(Json(out).into_response())
 }
@@ -848,6 +1091,9 @@ async fn spaces(State(app): State<App>, h: HeaderMap) -> R {
 struct SpaceAdd {
     id: String,
     name: String,
+    /// Ende-zu-Ende-verschlüsselt anlegen: die Passphrase legt danach der Besitzer in Obsidian fest.
+    #[serde(default)]
+    e2ee: bool,
 }
 
 async fn space_add(State(app): State<App>, h: HeaderMap, Json(req): Json<SpaceAdd>) -> R {
@@ -860,8 +1106,11 @@ async fn space_add(State(app): State<App>, h: HeaderMap, Json(req): Json<SpaceAd
             return Err(conflict(format!("Einen Vault mit der ID „{id}“ gibt es schon")));
         }
         st.add_space(&id, &name).map_err(|_| bad("ID: nur a-z, 0-9, _ und - (max. 64 Zeichen)"))?;
+        if req.e2ee {
+            st.set_space_e2ee(&id, Some(crate::db::E2EE_PENDING))?;
+        }
     }
-    audit(&app, &c, "space.add", &id);
+    audit(&app, &c, "space.add", if req.e2ee { format!("{id} (Ende-zu-Ende-verschlüsselt)") } else { id.clone() });
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -1086,6 +1335,10 @@ struct UploadQ {
 async fn upload(State(app): State<App>, h: HeaderMap, Path(space): Path<String>, Query(q): Query<UploadQ>, body: Body) -> R {
     let c = ctx(&app, &h)?;
     check_space(&app, &space)?;
+    // Vor dem Speichern prüfen: in einem verschlüsselten Vault darf kein Klartext-Anhang landen.
+    if app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).space_e2ee(&space)?.is_some() {
+        return Err(HubError::E2ee.into());
+    }
     let path = q.path.trim().to_string();
     vault::valid_path(&path).map_err(bad)?;
     match vault::kind_for_path(&path) {

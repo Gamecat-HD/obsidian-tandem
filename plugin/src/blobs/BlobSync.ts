@@ -7,6 +7,7 @@ import type { VaultIndex } from "../docs/VaultIndex";
 import type { DiskBridge } from "../disk/DiskBridge";
 import { sha256Hex } from "../disk/diff";
 import type { LocalStore } from "../docs/LocalStore";
+import type { SpaceKey } from "../crypto/e2ee";
 
 export const MAX_BLOB = 100 * 1024 * 1024;
 
@@ -25,6 +26,8 @@ export class BlobSync {
 		readonly store: LocalStore,
 		readonly space: string,
 		readonly http: () => { base: string; token: string },
+		/** Verschlüsselter Space: Anhänge werden vor dem Hochladen verschlüsselt (Adresse = Hash des Chiffretexts). */
+		readonly key: SpaceKey | null = null,
 	) {
 		this.loaded = Promise.all([
 			store.getMeta<Record<string, string>>(`blobs:${space}`).then((m) => {
@@ -100,19 +103,22 @@ export class BlobSync {
 			this.remember(file.path, hash);
 			return;
 		}
-		const head = await requestUrl({ url: this.url(hash), method: "HEAD", headers: this.headers(), throw: false });
+		const sealed = this.key ? await this.key.sealBlob(new Uint8Array(data), hash) : null;
+		const addr = sealed?.ehash ?? hash;
+		const head = await requestUrl({ url: this.url(addr), method: "HEAD", headers: this.headers(), throw: false });
 		if (head.status === 404) {
 			const r = await requestUrl({
-				url: this.url(hash),
+				url: this.url(addr),
 				method: "PUT",
 				headers: { ...this.headers(), "Content-Type": "application/octet-stream" },
-				body: data,
+				body: sealed ? (sealed.data.buffer.slice(sealed.data.byteOffset, sealed.data.byteOffset + sealed.data.byteLength) as ArrayBuffer) : data,
 				throw: false,
 			});
 			if (r.status >= 300) throw new Error(`Upload ${file.path}: HTTP ${r.status}`);
 		} else if (head.status >= 300) throw new Error(`Upload ${file.path}: HTTP ${head.status}`);
-		if (id) this.index.update(id, { hash, size: data.byteLength, parent: entry?.hash });
-		else this.index.add(file.path, "blob", { hash, size: data.byteLength });
+		const extra = sealed ? { ehash: sealed.ehash } : {};
+		if (id) this.index.update(id, { hash, size: data.byteLength, parent: entry?.hash, ...extra });
+		else this.index.add(file.path, "blob", { hash, size: data.byteLength, ...extra });
 		this.remember(file.path, hash);
 	}
 
@@ -129,7 +135,10 @@ export class BlobSync {
 		await this.loaded;
 		// Inzwischen von noch neuerer Fassung überholt?
 		const id = this.index.idForPath(path);
-		if (id && this.index.get(id)?.hash !== hash) return;
+		const entry = id ? this.index.get(id) : undefined;
+		if (id && entry?.hash !== hash) return;
+		const addr = this.key ? entry?.ehash : hash;
+		if (!addr) throw new Error(`Download ${path}: Adresse des verschlüsselten Anhangs fehlt`);
 		const file = this.app.vault.getFileByPath(path);
 		if (file) {
 			const local = await sha256Hex(await this.app.vault.readBinary(file));
@@ -143,11 +152,16 @@ export class BlobSync {
 				await this.app.vault.copy(file, copy);
 			}
 		}
-		const r = await requestUrl({ url: this.url(hash), method: "GET", headers: this.headers(), throw: false });
+		const r = await requestUrl({ url: this.url(addr), method: "GET", headers: this.headers(), throw: false });
 		if (r.status !== 200) throw new Error(`Download ${path}: HTTP ${r.status}`);
-		const got = await sha256Hex(r.arrayBuffer);
+		let content = r.arrayBuffer;
+		if (this.key) {
+			const plain = await this.key.openBlob(new Uint8Array(content));
+			content = plain.buffer.slice(plain.byteOffset, plain.byteOffset + plain.byteLength) as ArrayBuffer;
+		}
+		const got = await sha256Hex(content);
 		if (got !== hash) throw new Error(`Download ${path}: Hash stimmt nicht`);
-		await this.bridge.writeBinary(path, r.arrayBuffer);
+		await this.bridge.writeBinary(path, content);
 		this.remember(path, hash);
 	}
 

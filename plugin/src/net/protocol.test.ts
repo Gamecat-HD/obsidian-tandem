@@ -18,12 +18,22 @@ const frames: [string, Frame][] = [
 	["catchup", { type: Msg.Catchup, space: "space", since: 129 }],
 	["ping", { type: Msg.Ping }],
 	["pong", { type: Msg.Pong }],
+	["elog", { type: Msg.ELog, doc: "space/abc", total: 3, rows: [{ id: 7, data: new Uint8Array([1, 2]) }, { id: 300, data: new Uint8Array([3]) }] }],
+	["eupd-server", { type: Msg.EUpd, doc: "space/abc", id: 300, data: new Uint8Array([9, 8, 7]) }],
+	["eack", { type: Msg.EAck, doc: "space/abc", id: 300 }],
+];
+
+/** Nur Client → Server (der Client dekodiert sie nicht selbst; der Rust-Server prüft sie). */
+const clientOnly: [string, Frame][] = [
+	["esub", { type: Msg.ESub, doc: "space/abc", since: 300 }],
+	["eupd-client", { type: Msg.EUpd, doc: "space/abc", id: 0, data: new Uint8Array([9, 8, 7]) }],
+	["ecompact", { type: Msg.ECompact, doc: "space/abc", upto: 300, data: new Uint8Array([5, 6]) }],
 ];
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
 
 describe("Protokoll-Testvektoren", () => {
-	const current = Object.fromEntries(frames.map(([k, f]) => [k, hex(encodeFrame(f))]));
+	const current = Object.fromEntries([...frames, ...clientOnly].map(([k, f]) => [k, hex(encodeFrame(f))]));
 	if (process.env.UPDATE_VECTORS) writeFileSync(FILE, JSON.stringify(current, null, "\t") + "\n");
 	const stored = JSON.parse(readFileSync(FILE, "utf8")) as Record<string, string>;
 	for (const [name, f] of frames) {
@@ -33,6 +43,7 @@ describe("Protokoll-Testvektoren", () => {
 			expect(JSON.stringify(back)).toBe(JSON.stringify(f));
 		});
 	}
+	for (const [name] of clientOnly) it(name, () => expect(current[name]).toBe(stored[name]));
 	it("lehnt Unsinn ab", () => {
 		expect(() => decodeFrame(new Uint8Array([99]))).toThrow();
 		expect(() => decodeFrame(new Uint8Array([2, 5, 97]))).toThrow();

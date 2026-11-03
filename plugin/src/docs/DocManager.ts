@@ -7,6 +7,7 @@ import type { Connection } from "../net/Connection";
 import { docName } from "../net/protocol";
 import { DocSession, REMOTE } from "./DocSession";
 import type { LocalStore } from "./LocalStore";
+import type { SpaceKey } from "../crypto/e2ee";
 
 interface Live {
 	session: DocSession;
@@ -29,10 +30,15 @@ export class DocManager {
 	private dirtyLoaded: Promise<void>;
 	private destroyed = false;
 
+	/** Entschlüsseln schlug fehl (einmal pro Ursache melden). */
+	onDecryptError: ((docId: string, e: Error) => void) | null = null;
+
 	constructor(
 		readonly conn: Connection,
 		readonly store: LocalStore,
 		readonly space: string,
+		/** Gesetzt = Ende-zu-Ende-verschlüsselter Space. */
+		readonly key: SpaceKey | null = null,
 	) {
 		this.dirtyLoaded = store.getMeta<string[]>(`dirty:${space}`).then((d) => {
 			for (const id of d ?? []) this.dirty.add(id);
@@ -47,19 +53,24 @@ export class DocManager {
 		let l = this.live.get(docId);
 		if (l && opts.awareness && !l.session.awareness) {
 			// Upgrade auf Live-Ansicht: Session mit Awareness neu aufbauen (selbes Y.Doc).
-			const doc = l.session.doc;
-			l.session.destroy();
-			l.session = new DocSession(this.conn, docName(this.space, docId), doc, { awareness: true });
+			const old = l.session;
+			old.destroy(); // vor dem Neuanlegen: beide Sessions teilen sich den Handler-Platz der Verbindung
+			l.session = this.newSession(docId, old.doc, { awareness: true });
+			l.session.adopt(old);
+			// Noch nicht gestartet (lokaler Stand lädt noch)? Dann startet sie der Lade-Abschluss.
+			if (old.isStarted) l.session.start();
 			this.hookDirty(docId, l.session);
 		}
 		if (!l) {
 			const doc = new Y.Doc();
-			const session = new DocSession(this.conn, docName(this.space, docId), doc, opts);
+			const session = this.newSession(docId, doc, opts);
 			const entry: Live = { session, refs: 0, persistTimer: null, releaseTimer: null, loaded: Promise.resolve() };
 			entry.loaded = this.store.get(docName(this.space, docId)).then((rec) => {
 				if (rec?.state?.length) Y.applyUpdate(doc, rec.state, REMOTE);
 				entry.base = rec?.base;
 				entry.edited = rec?.edited;
+				// Verschlüsselt: erst jetzt abonnieren – ab der gespeicherten Log-Position, mit den offenen Updates.
+				entry.session.start(rec?.e2ee);
 			});
 			doc.on("update", (_u: Uint8Array, origin: unknown) => {
 				if (origin === REMOTE) this.onRemoteUpdate?.(docId);
@@ -74,6 +85,13 @@ export class DocManager {
 		l.releaseTimer = null;
 		await l.loaded;
 		return l.session;
+	}
+
+	private newSession(docId: string, doc: Y.Doc, opts: { awareness?: boolean }) {
+		const s = new DocSession(this.conn, docName(this.space, docId), doc, { ...opts, key: this.key, deferStart: !!this.key });
+		s.onDurable = () => this.schedulePersist(docId);
+		s.onDecryptError = (e) => this.onDecryptError?.(docId, e);
+		return s;
 	}
 
 	private hookDirty(docId: string, s: DocSession) {
@@ -91,6 +109,8 @@ export class DocManager {
 		const drop = () => {
 			if (l.refs > 0) return;
 			this.live.delete(docId);
+			// Verschlüsselt: noch unbestätigte Updates → beim nächsten Online-Gehen erneut laden und senden.
+			if (l.session.e2eeState()?.pending) this.markDirty(docId);
 			void this.persistNow(docId, l).finally(() => {
 				l.session.destroy();
 				l.session.doc.destroy();
@@ -167,7 +187,13 @@ export class DocManager {
 		l.persistTimer = null;
 		await l.loaded;
 		if (this.destroyed) return;
-		await this.store.put({ name: docName(this.space, docId), state: Y.encodeStateAsUpdate(l.session.doc), base: l.base, edited: l.edited });
+		await this.store.put({
+			name: docName(this.space, docId),
+			state: Y.encodeStateAsUpdate(l.session.doc),
+			base: l.base,
+			edited: l.edited,
+			e2ee: l.session.e2eeState(),
+		});
 	}
 
 	/** Ausstehendes Speichern sofort erledigen (falls das Doc gerade geladen ist). */

@@ -1,5 +1,6 @@
 import { Notice, PluginSettingTab, Setting, type App } from "obsidian";
 import type TandemPlugin from "./main";
+import { checkTransport } from "./net/transport";
 
 export interface TandemSettings {
 	enabled: boolean;
@@ -43,7 +44,7 @@ export class TandemSettingTab extends PluginSettingTab {
 			});
 		}
 
-		new Setting(containerEl)
+		const serverSetting = new Setting(containerEl)
 			.setName("Server")
 			.setDesc("Adresse des Tandem-Servers, z. B. https://tandem.example.org")
 			.addText((t) =>
@@ -53,8 +54,15 @@ export class TandemSettingTab extends PluginSettingTab {
 					.onChange(async (v) => {
 						p.settings.serverUrl = v.trim();
 						await p.saveSettings();
+						showTransport();
 					}),
 			);
+		const transportWarn = serverSetting.descEl.createDiv({ cls: "tandem-error" });
+		const showTransport = () => {
+			const t = p.settings.serverUrl ? checkTransport(p.settings.serverUrl) : { ok: true as const };
+			transportWarn.setText(t.ok ? "" : t.reason);
+		};
+		showTransport();
 
 		let code = "";
 		new Setting(containerEl)
@@ -126,7 +134,93 @@ export class TandemSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl).setName("Neu verbinden").addButton((b) => b.setButtonText("Jetzt").onClick(() => void p.restart()));
 
+		this.renderEncryption(containerEl.createDiv());
 		this.renderPeople(containerEl.createDiv());
+		this.renderUpdate(containerEl.createDiv());
+	}
+
+	/** Ende-zu-Ende-Verschlüsselung: Zustand, Einrichten (Besitzer, leerer Vault), Entsperren, Schlüssel vergessen. */
+	private renderEncryption(el: HTMLElement) {
+		const p = this.plugin;
+		new Setting(el).setName("Verschlüsselung").setHeading();
+		const mode = p.e2eeMode;
+		const owner = p.role() === "owner";
+		if (mode === "plain") {
+			const s = new Setting(el)
+				.setName("Nicht Ende-zu-Ende-verschlüsselt")
+				.setDesc(
+					"Die Verbindung ist per HTTPS geschützt, der Server kann die Inhalte aber lesen (Admin-Ansicht, Suche, Export, Lese-API). " +
+						(owner ? "Verschlüsseln lässt sich nur ein Vault, der noch leer ist – am einfachsten einen neuen Vault dafür anlegen." : ""),
+				);
+			if (owner && p.conn?.status === "online")
+				s.addButton((b) => b.setButtonText("Verschlüsselung einrichten …").onClick(() => p.askPassphrase("set")));
+			return;
+		}
+		if (mode === "pending") {
+			const s = new Setting(el)
+				.setName("Wartet auf die Passphrase")
+				.setDesc(owner ? "Der Vault ist für Verschlüsselung angelegt. Lege jetzt die Passphrase fest – erst danach wird synchronisiert." : "Die Besitzerin/der Besitzer muss die Passphrase erst festlegen.");
+			if (owner) s.addButton((b) => b.setButtonText("Passphrase festlegen …").setCta().onClick(() => p.askPassphrase("set")));
+			return;
+		}
+		if (p.key) {
+			new Setting(el)
+				.setName("Ende-zu-Ende-verschlüsselt 🔒")
+				.setDesc("Auf diesem Gerät entsperrt. Der Server sieht nur Chiffretext – Admin-Ansicht, Export und Lese-API sind für diesen Vault aus. Neue Geräte und eingeladene Personen brauchen die Passphrase.")
+				.addButton((b) =>
+					b
+						.setButtonText("Schlüssel auf diesem Gerät vergessen")
+						.setWarning()
+						.onClick(async () => {
+							await p.forgetKey();
+							this.display();
+						}),
+				);
+		} else {
+			new Setting(el)
+				.setName("Gesperrt")
+				.setDesc("Dieser Vault ist Ende-zu-Ende-verschlüsselt. Ohne Passphrase wird nicht synchronisiert.")
+				.addButton((b) => b.setButtonText("Entsperren …").setCta().onClick(() => p.askPassphrase("unlock")));
+		}
+	}
+
+	/** Version und Update aus den GitHub-Releases. */
+	private renderUpdate(el: HTMLElement) {
+		const p = this.plugin;
+		new Setting(el).setName("Version").setHeading();
+		const s = new Setting(el).setName(`Tandem ${p.manifest.version}`);
+		const show = () => {
+			s.controlEl.empty();
+			const rel = p.update;
+			if (rel) {
+				s.setDesc(`Version ${rel.version} ist verfügbar.`);
+				s.addExtraButton((b) => b.setIcon("external-link").setTooltip("Änderungen ansehen").onClick(() => window.open(rel.url)));
+				s.addButton((b) =>
+					b
+						.setButtonText(`Auf ${rel.version} aktualisieren`)
+						.setCta()
+						.onClick(async () => {
+							b.setDisabled(true).setButtonText("Lade …");
+							try {
+								await p.installUpdate(rel);
+							} catch (e) {
+								new Notice(`Tandem: Update fehlgeschlagen – ${(e as Error).message}`, 12000);
+								b.setDisabled(false).setButtonText(`Auf ${rel.version} aktualisieren`);
+							}
+						}),
+				);
+			} else {
+				s.setDesc("Lädt neue Versionen direkt aus den GitHub-Releases (Prüfsummen werden kontrolliert). Jedes Gerät aktualisiert sich selbst.");
+				s.addButton((b) =>
+					b.setButtonText("Nach Updates suchen").onClick(async () => {
+						b.setDisabled(true).setButtonText("Suche …");
+						await p.checkUpdate(false);
+						show();
+					}),
+				);
+			}
+		};
+		show();
 	}
 
 	/** Personen & Einladungen (Einladen nur für Besitzer). */

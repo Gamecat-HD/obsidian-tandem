@@ -11,6 +11,8 @@ export interface StoredDoc {
 	base?: string;
 	/** Zeitpunkt der letzten lokalen (nicht vom Server stammenden) Änderung. */
 	edited?: number;
+	/** Verschlüsselte Spaces: gelesene Log-Position + noch unbestätigte lokale Updates. */
+	e2ee?: { cursor: number; pending?: Uint8Array };
 }
 
 function req<T>(r: IDBRequest<T>): Promise<T> {

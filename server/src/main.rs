@@ -9,6 +9,7 @@ mod metrics;
 mod server;
 mod tar;
 mod vault;
+mod webauthn;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -98,7 +99,13 @@ enum UserCmd {
 
 #[derive(Subcommand)]
 enum SpaceCmd {
-    Add { id: String, name: String },
+    Add {
+        id: String,
+        name: String,
+        /// Ende-zu-Ende-verschlüsselt: der Server sieht nur Chiffretext (Admin-Ansicht, Export und Lese-API entfallen)
+        #[arg(long)]
+        e2ee: bool,
+    },
     List,
     /// Mitglied hinzufügen/Rolle ändern (owner, write, read)
     Member { space: String, user: String, role: String },
@@ -198,9 +205,14 @@ fn main() -> Result<()> {
             }
         },
         Cmd::Space { cmd } => match cmd {
-            SpaceCmd::Add { id, name } => {
+            SpaceCmd::Add { id, name, e2ee } => {
                 store.add_space(&id, &name)?;
-                println!("Space {id} angelegt");
+                if e2ee {
+                    store.set_space_e2ee(&id, Some(db::E2EE_PENDING))?;
+                    println!("Space {id} angelegt (Ende-zu-Ende-verschlüsselt – der Besitzer legt die Passphrase in Obsidian fest)");
+                } else {
+                    println!("Space {id} angelegt");
+                }
             }
             SpaceCmd::List => {
                 for (id, name, seq, members) in store.spaces()? {

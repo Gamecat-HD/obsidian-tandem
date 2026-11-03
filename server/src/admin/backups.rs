@@ -147,6 +147,9 @@ fn open(app: &App, name: &str) -> Result<rusqlite::Connection, E> {
 }
 
 fn backup_index(conn: &rusqlite::Connection, space: &str) -> Result<Vec<Entry>, E> {
+    if backup::is_e2ee(conn, space) {
+        return Err(crate::hub::HubError::E2ee.into());
+    }
     Ok(backup::load_doc(conn, &index_name(space))?.map(|d| vault::read_index(&d)).unwrap_or_default())
 }
 
@@ -166,8 +169,13 @@ pub async fn spaces(State(app): State<App>, h: HeaderMap, Path(name): Path<Strin
     let list = backup::spaces(&conn)?;
     let mut out = Vec::new();
     for (id, title) in list {
+        // Verschlüsselte Vaults: Inhalt nicht lesbar – trotzdem auflisten, damit die übrigen durchsuchbar bleiben.
+        if backup::is_e2ee(&conn, &id) {
+            out.push(json!({ "id": id, "name": title, "files": null, "e2ee": true }));
+            continue;
+        }
         let files = backup_index(&conn, &id)?.into_iter().filter(|e| !e.del).count();
-        out.push(json!({ "id": id, "name": title, "files": files }));
+        out.push(json!({ "id": id, "name": title, "files": files, "e2ee": false }));
     }
     Ok(Json(out).into_response())
 }

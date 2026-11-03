@@ -18,6 +18,12 @@ export const enum Msg {
 	Catchup = 7,
 	Ping = 8,
 	Pong = 9,
+	// Ende-zu-Ende-verschlüsselte Spaces (docs/E2EE.md): der Server führt nur ein Log aus Chiffretext.
+	ESub = 10,
+	ELog = 11,
+	EUpd = 12,
+	EAck = 13,
+	ECompact = 14,
 }
 
 export const enum SyncSub {
@@ -26,9 +32,27 @@ export const enum SyncSub {
 	Update = 2,
 }
 
+/** Öffentliche Schlüsselparameter eines verschlüsselten Space (Passphrase und Schlüssel bleiben auf den Geräten). */
+export interface E2eeParams {
+	v: 1;
+	kdf: "pbkdf2-sha256";
+	iter: number;
+	salt: string;
+	/** Mit dem Schlüssel verschlüsselter Prüfwert – zeigt, ob eine eingegebene Passphrase stimmt. */
+	check: string;
+}
+
+export interface WelcomeSpace {
+	id: string;
+	name: string;
+	role: "owner" | "write" | "read";
+	/** fehlt = Klartext, "pending" = Besitzer muss die Passphrase noch festlegen */
+	e2ee?: E2eeParams | "pending";
+}
+
 export interface WelcomeInfo {
 	user: { id: string; name: string; color: string };
-	spaces: { id: string; name: string; role: "owner" | "write" | "read" }[];
+	spaces: WelcomeSpace[];
 }
 
 export type Frame =
@@ -41,7 +65,12 @@ export type Frame =
 	| { type: Msg.Changes; space: string; seq: number; docs: string[] }
 	| { type: Msg.Catchup; space: string; since: number }
 	| { type: Msg.Ping }
-	| { type: Msg.Pong };
+	| { type: Msg.Pong }
+	| { type: Msg.ESub; doc: string; since: number }
+	| { type: Msg.ELog; doc: string; total: number; rows: { id: number; data: Uint8Array }[] }
+	| { type: Msg.EUpd; doc: string; id: number; data: Uint8Array }
+	| { type: Msg.EAck; doc: string; id: number }
+	| { type: Msg.ECompact; doc: string; upto: number; data: Uint8Array };
 
 export function encodeFrame(f: Frame): Uint8Array {
 	const e = encoding.createEncoder();
@@ -85,6 +114,34 @@ export function encodeFrame(f: Frame): Uint8Array {
 		case Msg.Ping:
 		case Msg.Pong:
 			break;
+		case Msg.ESub:
+			encoding.writeVarString(e, f.doc);
+			encoding.writeVarUint(e, f.since);
+			break;
+		case Msg.ELog:
+			encoding.writeVarString(e, f.doc);
+			encoding.writeVarUint(e, f.total);
+			encoding.writeVarUint(e, f.rows.length);
+			for (const r of f.rows) {
+				encoding.writeVarUint(e, r.id);
+				encoding.writeVarUint8Array(e, r.data);
+			}
+			break;
+		case Msg.EUpd:
+			// Client → Server ohne ID (id = 0 wird nicht geschrieben), Server → Client mit Zeilen-ID
+			encoding.writeVarString(e, f.doc);
+			if (f.id) encoding.writeVarUint(e, f.id);
+			encoding.writeVarUint8Array(e, f.data);
+			break;
+		case Msg.EAck:
+			encoding.writeVarString(e, f.doc);
+			encoding.writeVarUint(e, f.id);
+			break;
+		case Msg.ECompact:
+			encoding.writeVarString(e, f.doc);
+			encoding.writeVarUint(e, f.upto);
+			encoding.writeVarUint8Array(e, f.data);
+			break;
 	}
 	return encoding.toUint8Array(e);
 }
@@ -125,6 +182,19 @@ export function decodeFrame(buf: Uint8Array): Frame {
 			case Msg.Ping:
 			case Msg.Pong:
 				return { type };
+			// Nur Server → Client (EUPD mit Zeilen-ID)
+			case Msg.ELog: {
+				const doc = decoding.readVarString(d);
+				const total = decoding.readVarUint(d);
+				const n = decoding.readVarUint(d);
+				const rows: { id: number; data: Uint8Array }[] = [];
+				for (let i = 0; i < n; i++) rows.push({ id: decoding.readVarUint(d), data: decoding.readVarUint8Array(d) });
+				return { type, doc, total, rows };
+			}
+			case Msg.EUpd:
+				return { type, doc: decoding.readVarString(d), id: decoding.readVarUint(d), data: decoding.readVarUint8Array(d) };
+			case Msg.EAck:
+				return { type, doc: decoding.readVarString(d), id: decoding.readVarUint(d) };
 			default:
 				throw new ProtocolError(`Unbekannter Frame-Typ ${type}`);
 		}

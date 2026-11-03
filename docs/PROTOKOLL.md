@@ -8,7 +8,7 @@ Jeder Frame beginnt mit `varUint type`.
 | type | Name | Richtung | Felder |
 |---|---|---|---|
 | 0 | HELLO | C→S | `varUint version (=1)`, `varString token`, `varString device` |
-| 1 | WELCOME | S→C | `varString json` → `{user:{id,name,color}, spaces:[{id,name,role}]}` |
+| 1 | WELCOME | S→C | `varString json` → `{user:{id,name,color}, spaces:[{id,name,role,e2ee?}]}` (`e2ee`: fehlt = Klartext, `"pending"` oder Schlüsselparameter, siehe [E2EE.md](E2EE.md)) |
 | 2 | SYNC | ↔ | `varString doc`, danach eine y-protocols-Sync-Nachricht (`varUint sub` 0=Step1 `varBytes sv` / 1=Step2 `varBytes update` / 2=Update `varBytes update`) |
 | 3 | AWARENESS | ↔ | `varString doc`, `varBytes awarenessUpdate` (y-protocols/awareness-Format) |
 | 4 | UNSUB | C→S | `varString doc` |
@@ -17,6 +17,7 @@ Jeder Frame beginnt mit `varUint type`.
 | 7 | CATCHUP | C→S | `varString space`, `varUint sinceSeq` |
 | 8 | PING | C→S | – |
 | 9 | PONG | S→C | – |
+| 10–14 | ESUB, ELOG, EUPD, EACK, ECOMPACT | ↔ | nur Ende-zu-Ende-verschlüsselte Spaces, siehe [E2EE.md](E2EE.md) |
 
 **Doc-Namen:** `<spaceId>/<docId>`. Der Dateibaum eines Space ist `<spaceId>/_index`.
 
@@ -38,6 +39,7 @@ Jeder Frame beginnt mit `varUint type`.
 | 401 | Token ungültig/widerrufen |
 | 403 | kein Zugriff auf den Space bzw. nur Lesezugriff (Update abgelehnt) |
 | 413 | Nachricht zu groß (Standard: 8 MiB) |
+| 426 | Space ist Ende-zu-Ende-verschlüsselt – Plugin zu alt (SYNC statt ESUB/EUPD) |
 | 500 | Serverfehler |
 
 ## HTTP
@@ -52,6 +54,7 @@ Authentifizierung: `Authorization: Bearer <token>`.
 | PUT | `/api/blob/<space>/<sha256>` | Anhang hochladen. Der Server prüft den Hash, Limit Standard 100 MiB |
 | GET | `/api/history/<space>/<docId>` | Liste der Snapshots `[{ts, size}]` |
 | GET | `/api/history/<space>/<docId>/<ts>` | Snapshot als Yjs-Update (binär) |
+| POST | `/api/e2ee/<space>` | Schlüsselparameter `{v, kdf, iter, salt, check}` festlegen (nur Besitzer, nur leerer bzw. wartender Space) → 204; 409 bei vorhandenem Inhalt |
 | GET | `/api/files/<space>` | Nur lesen (für Dienste wie die Lernplattform): `{files: [{id, path, kind, size, ts, rev}]}` – lebende Einträge, je Pfad einer (kleinste docId). `rev` = Änderungszähler des Docs (md/ink) bzw. Hash (blob) |
 | GET | `/api/file/<space>/<docId>` | Inhalt als Datei: md als Text, ink als `.ink`-JSON (wie `encodeInkDoc`), blob als Bytes; Header `X-Tandem-Rev` |
 

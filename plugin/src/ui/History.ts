@@ -8,6 +8,7 @@ import * as Y from "yjs";
 import type { SpaceSync } from "../sync/SpaceSync";
 import { applyTextDiff, textChanges } from "../disk/diff";
 import { applyInkFile, encodeInkDoc } from "../ink/inkDoc";
+import type { SpaceKey } from "../crypto/e2ee";
 
 export interface Snapshot {
 	ts: number;
@@ -24,7 +25,7 @@ export async function listSnapshots(http: { base: string; token: string }, space
 	return r.json as Snapshot[];
 }
 
-export async function loadSnapshot(http: { base: string; token: string }, space: string, docId: string, ts: number): Promise<Y.Doc> {
+export async function loadSnapshot(http: { base: string; token: string }, space: string, docId: string, ts: number, key?: SpaceKey | null): Promise<Y.Doc> {
 	const r = await requestUrl({
 		url: `${http.base}/api/history/${encodeURIComponent(space)}/${encodeURIComponent(docId)}/${ts}`,
 		headers: { Authorization: `Bearer ${http.token}` },
@@ -32,7 +33,9 @@ export async function loadSnapshot(http: { base: string; token: string }, space:
 	});
 	if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
 	const doc = new Y.Doc();
-	Y.applyUpdate(doc, new Uint8Array(r.arrayBuffer));
+	// Verschlüsselte Spaces: Snapshots sind die vom Client verdichteten, verschlüsselten Stände.
+	const data = new Uint8Array(r.arrayBuffer);
+	Y.applyUpdate(doc, key ? await key.openDoc(`${space}/${docId}`, data) : data);
 	return doc;
 }
 
@@ -90,7 +93,11 @@ export class HistoryModal extends Modal {
 		}
 		list.empty();
 		if (!snaps.length) {
-			list.setText("Noch keine gespeicherten Fassungen. Der Server legt höchstens stündlich eine an, sobald sich etwas geändert hat.");
+			list.setText(
+				this.sync.key
+					? "Noch keine gespeicherten Fassungen. In verschlüsselten Vaults entstehen sie, wenn ein Gerät die Notiz verdichtet (nach vielen Änderungen), höchstens stündlich."
+					: "Noch keine gespeicherten Fassungen. Der Server legt höchstens stündlich eine an, sobald sich etwas geändert hat.",
+			);
 			return;
 		}
 		for (const s of snaps) {
@@ -105,7 +112,7 @@ export class HistoryModal extends Modal {
 						.setCta()
 						.onClick(async () => {
 							try {
-								const doc = await loadSnapshot(this.http, this.space, this.docId, s.ts);
+								const doc = await loadSnapshot(this.http, this.space, this.docId, s.ts, this.sync.key);
 								await restoreSnapshot(this.sync, this.docId, doc);
 								new Notice(`Tandem: Fassung vom ${when} wiederhergestellt (rückgängig machbar).`);
 								this.close();
@@ -119,7 +126,7 @@ export class HistoryModal extends Modal {
 
 	private async show(ts: number) {
 		try {
-			const doc = await loadSnapshot(this.http, this.space, this.docId, ts);
+			const doc = await loadSnapshot(this.http, this.space, this.docId, ts, this.sync.key);
 			const entry = this.sync.index.get(this.docId);
 			const text = entry?.kind === "ink" ? `Handschrift-Fläche mit ${doc.getMap("strokes").size} Strichen` : doc.getText("content").toString();
 			this.preview.setText(text.length > 20000 ? text.slice(0, 20000) + "\n…" : text);

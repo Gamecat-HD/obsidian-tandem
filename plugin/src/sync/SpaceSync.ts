@@ -13,6 +13,7 @@ import { sha256Hex } from "../disk/diff";
 import { DiskBridge } from "../disk/DiskBridge";
 import { EditorBinder } from "../editor/EditorBinder";
 import { BlobSync } from "../blobs/BlobSync";
+import type { SpaceKey } from "../crypto/e2ee";
 
 export interface SpaceSyncOptions {
 	app: App;
@@ -23,6 +24,8 @@ export interface SpaceSyncOptions {
 	user(): { id: string; name: string; color: string };
 	http(): { base: string; token: string };
 	log?(msg: string): void;
+	/** Ende-zu-Ende-verschlüsselter Space: Schlüssel (sonst null). */
+	key?: SpaceKey | null;
 }
 
 /** Standard-Ignorierliste (zusätzlich zu den Einstellungen). */
@@ -74,7 +77,7 @@ export class SpaceSync {
 	private idleWaiters: (() => void)[] = [];
 
 	constructor(readonly o: SpaceSyncOptions) {
-		this.docs = new DocManager(o.conn, o.store, o.space);
+		this.docs = new DocManager(o.conn, o.store, o.space, o.key ?? null);
 	}
 
 	private log(msg: string) {
@@ -96,7 +99,7 @@ export class SpaceSync {
 			readOnly: () => this.role() === "read",
 			exclusive: <T,>(path: string, fn: () => Promise<T>) => (this.inkExclusive ? this.inkExclusive(path, fn) : fn()),
 		});
-		this.blobs = new BlobSync(app, this.index, this.bridge, this.o.store, this.o.space, this.o.http);
+		this.blobs = new BlobSync(app, this.index, this.bridge, this.o.store, this.o.space, this.o.http, this.o.key ?? null);
 		this.binder = new EditorBinder({
 			app,
 			docs: this.docs,
@@ -178,6 +181,10 @@ export class SpaceSync {
 		this.o.conn.send({ type: Msg.Catchup, space: this.o.space, since: this.seq });
 		await this.scan();
 		this.binder.refresh();
+	}
+
+	get key(): SpaceKey | null {
+		return this.o.key ?? null;
 	}
 
 	role(): string | undefined {
