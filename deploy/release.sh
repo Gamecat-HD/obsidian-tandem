@@ -21,7 +21,7 @@ OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 (cd plugin && npm ci --silent && npm test --silent && npm run build --silent)
 cp plugin/main.js plugin/manifest.json plugin/styles.css "$OUT/"
-(cd "$OUT" && mkdir tandem && cp main.js manifest.json styles.css tandem/ && zip -qr "tandem-$VER.zip" tandem && rm -r tandem)
+(cd "$OUT" && mkdir tandem && cp main.js manifest.json styles.css tandem/ && python3 -m zipfile -c "tandem-$VER.zip" tandem && rm -r tandem)
 (cd server && cargo test -q && ./build-static.sh >/dev/null)
 cp server/target/x86_64-unknown-linux-musl/release/tandem-server "$OUT/tandem-server-$VER-x86_64-linux-musl"
 (cd "$OUT" && sha256sum main.js manifest.json styles.css "tandem-$VER.zip" "tandem-server-$VER-x86_64-linux-musl" > SHA256SUMS && cat SHA256SUMS)
