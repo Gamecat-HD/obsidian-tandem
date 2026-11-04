@@ -51,6 +51,9 @@ enum Cmd {
         user: String,
         #[arg(long, default_value_t = 72)]
         hours: i64,
+        /// Vault, für den das Gerät gilt (sonst bindet es sich beim ersten Verbinden an den geöffneten Vault)
+        #[arg(long)]
+        space: Option<String>,
     },
     /// Noch nicht eingelösten Einladungscode einer anderen Person zuordnen
     InviteMove { code: String, user: String },
@@ -185,7 +188,7 @@ fn main() -> Result<()> {
                 store.add_space(&space, &space)?;
             }
             store.set_member(&space, &user, "owner")?;
-            let code = store.create_invite(&user, 72)?;
+            let code = store.create_invite(&user, 72, Some(&space))?;
             println!("Space „{space}“ mit Besitzer {user} eingerichtet.\nEinladungscode (72 h gültig): {code}");
         }
         Cmd::User { cmd } => match cmd {
@@ -228,8 +231,8 @@ fn main() -> Result<()> {
                 println!("{user} aus {space} entfernt");
             }
         },
-        Cmd::Invite { user, hours } => {
-            let code = store.create_invite(&user, hours)?;
+        Cmd::Invite { user, hours, space } => {
+            let code = store.create_invite(&user, hours, space.as_deref())?;
             println!("{code}");
         }
         Cmd::InviteMove { code, user } => {
@@ -239,9 +242,10 @@ fn main() -> Result<()> {
         Cmd::Token { cmd } => match cmd {
             TokenCmd::Issue { user, device } => println!("{}", store.issue_token(&user, &device)?),
             TokenCmd::List => {
-                for (id, user, device, created, last, revoked) in store.tokens()? {
+                for (id, user, device, space, created, last, revoked) in store.tokens()? {
                     println!(
-                        "{id}  {user:<16} {device:<20} erstellt={created} zuletzt={} {}",
+                        "{id}  {user:<16} {device:<20} vault={} erstellt={created} zuletzt={} {}",
+                        space.as_deref().unwrap_or("-"),
                         last.map(|l| l.to_string()).unwrap_or("-".into()),
                         if revoked { "GESPERRT" } else { "" }
                     );

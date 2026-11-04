@@ -188,6 +188,8 @@ export default class TandemPlugin extends Plugin {
 		});
 		if (this.conn !== conn) return; // inzwischen neu gestartet
 		const space = this.settings.space;
+		const hasAccess = () => !!conn.welcome?.spaces.some((s) => s.id === space);
+		const denied = conn.status === "online" && !hasAccess();
 		const mode = this.currentMode(conn.welcome?.spaces.find((s) => s.id === space));
 		this.e2eeMode = mode;
 		this.key = null;
@@ -195,9 +197,21 @@ export default class TandemPlugin extends Plugin {
 		// Modus hat sich auf dem Server geändert (z. B. Verschlüsselung eingerichtet) → neu starten.
 		conn.onStatus((s) => {
 			if (s !== "online" || this.conn !== conn) return;
+			if (denied) {
+				if (hasAccess()) void this.restart();
+				return;
+			}
 			const now = this.currentMode(conn.welcome?.spaces.find((x) => x.id === space));
 			if (modeKey(now) !== modeKey(mode)) void this.restart();
 		});
+		if (denied) {
+			// Ein Gerät gehört zu einem Vault. Ohne Zugriff sähe der Server nur 403er, in der Statusleiste stünde aber „online“.
+			const own = conn.welcome?.spaces.map((s) => `„${s.id}“`).join(", ");
+			this.statusNote = "kein Zugriff auf den Space";
+			this.renderStatus(conn.status);
+			new Notice(`Tandem: Dieses Gerät hat keinen Zugriff auf den Space „${space}“.${own ? ` Es ist angemeldet für ${own}.` : ""} Space korrigieren oder einen Einladungscode für diesen Vault einlösen.`, 15000);
+			return;
+		}
 		if (mode === "pending") {
 			// Verbindung bleibt offen: Sobald die Passphrase festgelegt ist, trennt der Server alle → Neustart.
 			const owner = conn.welcome?.spaces.find((s) => s.id === space)?.role === "owner";
@@ -487,9 +501,11 @@ export default class TandemPlugin extends Plugin {
 			throw: false,
 		});
 		if (r.status !== 200) throw new Error(r.status === 404 || r.status === 400 ? "Code ungültig oder abgelaufen" : `HTTP ${r.status}`);
-		const { token, user, spaces } = r.json as { token: string; user: { name: string }; spaces: { id: string }[] };
+		const { token, user, spaces, space } = r.json as { token: string; user: { name: string }; spaces: { id: string }[]; space?: string | null };
 		this.token = token;
 		if (!this.settings.space && spaces?.length) this.settings.space = spaces[0].id;
+		// Bewusst nicht umstellen: Ein falscher Code darf diesen Vault nicht in einen anderen Space schreiben.
+		else if (space && this.settings.space !== space) new Notice(`Tandem: Der Code gilt für den Space „${space}“, hier ist „${this.settings.space}“ eingetragen. Es wird nichts abgeglichen, bis das übereinstimmt.`, 15000);
 		await this.saveSettings();
 		return user.name;
 	}

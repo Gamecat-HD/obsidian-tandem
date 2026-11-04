@@ -49,7 +49,7 @@ Authentifizierung: `Authorization: Bearer <token>`.
 | Methode | Pfad | Zweck |
 |---|---|---|
 | GET | `/health` | `ok` |
-| POST | `/api/redeem` | `{code, device}` → `{token, user}`. Löst eine Einladung ein (Rate-Limit) |
+| POST | `/api/redeem` | `{code, device}` → `{token, user, spaces, space}`. Löst eine Einladung ein (Rate-Limit). `space` = Vault, für den das Token gilt, sonst `null`: Dann bindet es sich beim ersten Zugriff über den WebSocket an den angesprochenen Space. Ein gebundenes Token bekommt für andere Spaces 403 |
 | HEAD/GET | `/api/blob/<space>/<sha256>` | Anhang prüfen bzw. laden |
 | PUT | `/api/blob/<space>/<sha256>` | Anhang hochladen. Der Server prüft den Hash, Limit Standard 100 MiB |
 | GET | `/api/history/<space>/<docId>` | Liste der Snapshots `[{ts, size}]` |

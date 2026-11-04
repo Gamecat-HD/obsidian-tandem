@@ -67,7 +67,7 @@ export class TandemSettingTab extends PluginSettingTab {
 		let code = "";
 		new Setting(containerEl)
 			.setName("Einladungscode")
-			.setDesc(p.token ? "Dieses Gerät ist angemeldet. Ein neuer Code ersetzt die Anmeldung." : "Code vom Server-Admin (tandem-server invite …)")
+			.setDesc(p.token ? "Dieser Vault ist auf diesem Gerät angemeldet. Ein neuer Code ersetzt die Anmeldung." : "Code vom Server-Admin (tandem-server invite …). Jeder Vault braucht auf jedem Gerät einen eigenen Code.")
 			.addText((t) => t.setPlaceholder("XXXX-XXXX-XXXX").onChange((v) => (code = v)))
 			.addButton((b) =>
 				b.setButtonText("Einlösen").onClick(async () => {
@@ -257,7 +257,7 @@ export class TandemSettingTab extends PluginSettingTab {
 		};
 		new Setting(el)
 			.setName("Weiteres eigenes Gerät anmelden")
-			.setDesc("Code für dein Tablet/Handy/zweites Notebook")
+			.setDesc("Code für dein Tablet/Handy/zweites Notebook, gilt für diesen Vault")
 			.addButton((b) =>
 				b.setButtonText("Code erzeugen").onClick(async () => {
 					try {

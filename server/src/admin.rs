@@ -101,6 +101,7 @@ pub fn router() -> Router<App> {
         .route("/users/{id}/invite", post(user_invite))
         .route("/devices/{id}/revoke", post(device_revoke))
         .route("/devices/{id}/unrevoke", post(device_unrevoke))
+        .route("/devices/{id}/space", post(device_assign))
         .route("/devices/{id}", axum::routing::delete(device_delete))
         .route("/devices/cleanup", post(devices_cleanup))
         .route("/stats", get(stats))
@@ -901,14 +902,31 @@ async fn user_delete(State(app): State<App>, h: HeaderMap, Path(id): Path<String
 #[derive(Deserialize)]
 struct InviteReq {
     hours: Option<i64>,
+    /// Vault, für den das Gerät gilt
+    space: Option<String>,
 }
 
 async fn user_invite(State(app): State<App>, h: HeaderMap, Path(id): Path<String>, Json(req): Json<InviteReq>) -> R {
     let c = ctx(&app, &h)?;
     let hours = req.hours.unwrap_or(72).clamp(1, 24 * 30);
-    let code = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).create_invite(&id, hours)?;
-    audit(&app, &c, "invite", format!("{id}, {hours} h"));
-    Ok(Json(json!({ "code": code, "hours": hours })).into_response())
+    let code = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).create_invite(&id, hours, req.space.as_deref())?;
+    audit(&app, &c, "invite", format!("{id}, {hours} h{}", req.space.as_deref().map(|s| format!(", {s}")).unwrap_or_default()));
+    Ok(Json(json!({ "code": code, "hours": hours, "space": req.space })).into_response())
+}
+
+#[derive(Deserialize)]
+struct AssignReq {
+    space: String,
+}
+
+/// Gerät einem Vault zuordnen; es verbindet sich neu und sieht danach nur noch diesen.
+async fn device_assign(State(app): State<App>, h: HeaderMap, Path(id): Path<String>, Json(req): Json<AssignReq>) -> R {
+    let c = ctx(&app, &h)?;
+    check_space(&app, &req.space)?;
+    let hash = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).assign_device(&id, &req.space)?;
+    let n = app.hub.kick_where(|k| k.token == hash);
+    audit(&app, &c, "device.assign", format!("{id} → {} ({n} Verbindungen neu)", req.space));
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn device_revoke(State(app): State<App>, h: HeaderMap, Path(id): Path<String>) -> R {

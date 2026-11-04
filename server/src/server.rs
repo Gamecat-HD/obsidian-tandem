@@ -71,11 +71,15 @@ async fn handle_socket(socket: WebSocket, app: App) {
         Ok(Some(Ok(Message::Binary(b)))) => b,
         _ => return,
     };
-    let (user, device, token_hash) = match codec::decode_client(&hello) {
+    let (user, bound, device, token_hash) = match codec::decode_client(&hello) {
         Ok(Frame::Hello { version: 1, token, device }) => {
             let u = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).auth(token).ok().flatten();
             match u {
-                Some(u) => (u, device.chars().take(64).collect::<String>(), sha256_hex(token.as_bytes())),
+                Some((u, bound)) => {
+                    let (device, hash) = (device.chars().take(64).collect::<String>(), sha256_hex(token.as_bytes()));
+                    let _ = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).rename_token(&hash, &device);
+                    (u, bound, device, hash)
+                }
                 None => {
                     let _ = sink.send(Message::Binary(codec::error(401, "", "Token ungültig").into())).await;
                     let _ = sink.close().await;
@@ -89,7 +93,12 @@ async fn handle_socket(socket: WebSocket, app: App) {
         }
         _ => return,
     };
-    let spaces_list = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).spaces_of(&user.id).unwrap_or_default();
+    let mut spaces_list = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).spaces_of(&user.id).unwrap_or_default();
+    // Ein Gerät gehört zu einem Vault: Gebunden sieht es nur diesen, sonst bindet es sich beim ersten Zugriff (unten).
+    let mut unbound = bound.is_none();
+    if let Some(b) = &bound {
+        spaces_list.retain(|s| &s.id == b);
+    }
     let spaces: HashMap<String, String> = spaces_list.iter().map(|s| (s.id.clone(), s.role.clone())).collect();
     let welcome = serde_json::json!({ "user": &user, "spaces": &spaces_list }).to_string();
     if sink.send(Message::Binary(codec::welcome(&welcome).into())).await.is_err() {
@@ -150,7 +159,16 @@ async fn handle_socket(socket: WebSocket, app: App) {
         };
         stats.bytes_in.fetch_add(data.len() as u64, Relaxed);
         app.hub.metrics.frame_in(data.len());
-        let res = match codec::decode_client(&data) {
+        let frame = codec::decode_client(&data);
+        if unbound {
+            if let Some(space) = frame.as_ref().ok().and_then(frame_space) {
+                match app.hub.bind_conn(id, space) {
+                    Ok(done) => unbound = !done,
+                    Err(e) => warn!(conn = id, "Gerät nicht an den Vault gebunden: {e:?}"),
+                }
+            }
+        }
+        let res = match frame {
             Ok(Frame::Sync { doc, sub, data }) => app.hub.on_sync(id, doc, sub, data).map_err(|e| (doc.to_string(), e)),
             Ok(Frame::Awareness { doc, data }) => app.hub.on_awareness(id, doc, data).map_err(|e| (doc.to_string(), e)),
             Ok(Frame::Unsub { doc }) => {
@@ -187,19 +205,31 @@ async fn handle_socket(socket: WebSocket, app: App) {
     info!(user = user.id, conn = id, "getrennt");
 }
 
+/// Der Space, den ein Frame anspricht (für die Bindung eines neuen Geräts).
+fn frame_space<'a>(f: &Frame<'a>) -> Option<&'a str> {
+    match f {
+        Frame::Sync { doc, .. } | Frame::Awareness { doc, .. } | Frame::ESub { doc, .. } | Frame::EUpd { doc, .. } | Frame::ECompact { doc, .. } => codec::split_doc(doc).map(|(s, _)| s),
+        Frame::Catchup { space, .. } => Some(space),
+        _ => None,
+    }
+}
+
 // ── HTTP ─────────────────────────────────────────────────────────────
 
 fn bearer(h: &HeaderMap) -> Option<&str> {
     h.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
 }
 
-fn auth(app: &App, h: &HeaderMap) -> Result<User, StatusCode> {
+fn auth(app: &App, h: &HeaderMap) -> Result<(User, Option<String>), StatusCode> {
     let t = bearer(h).ok_or(StatusCode::UNAUTHORIZED)?;
     app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).auth(t).ok().flatten().ok_or(StatusCode::UNAUTHORIZED)
 }
 
 pub(crate) fn require_role(app: &App, h: &HeaderMap, space: &str, write: bool) -> Result<User, StatusCode> {
-    let u = auth(app, h)?;
+    let (u, bound) = auth(app, h)?;
+    if bound.is_some_and(|b| b != space) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let role = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).role(space, &u.id).ok().flatten().ok_or(StatusCode::FORBIDDEN)?;
     if write && role == "read" {
         return Err(StatusCode::FORBIDDEN);
@@ -236,10 +266,13 @@ async fn redeem(State(app): State<App>, h: HeaderMap, Json(req): Json<RedeemReq>
     }
     let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
     match st.redeem(&req.code, &req.device) {
-        Ok((token, user)) => {
-            let spaces = st.spaces_of(&user.id).unwrap_or_default();
+        Ok((token, user, space)) => {
+            let mut spaces = st.spaces_of(&user.id).unwrap_or_default();
+            if let Some(b) = &space {
+                spaces.retain(|s| &s.id == b);
+            }
             info!(user = user.id, device = req.device, "Einladung eingelöst");
-            Json(serde_json::json!({ "token": token, "user": user, "spaces": spaces })).into_response()
+            Json(serde_json::json!({ "token": token, "user": user, "spaces": spaces, "space": space })).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
@@ -283,7 +316,7 @@ async fn invite(State(app): State<App>, h: HeaderMap, Json(req): Json<InviteReq>
             (None, None) => "write".to_string(),
         };
         st.set_member(&req.space, &user, &role)?;
-        Ok((st.create_invite(&user, hours)?, role))
+        Ok((st.create_invite(&user, hours, Some(&req.space))?, role))
     })();
     match res {
         Ok((code, role)) => {

@@ -106,6 +106,19 @@ impl Hub {
         id
     }
 
+    /// Ungebundenes Gerät an den Vault binden, den es gerade öffnet; die Verbindung sieht danach nur noch diesen.
+    /// false: Kein Zugriff auf den Space, die Bindung steht noch aus.
+    pub fn bind_conn(&self, id: ConnId, space: &str) -> Result<bool, HubError> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(c) = g.conns.get_mut(&id) else { return Ok(false) };
+        if !c.spaces.contains_key(space) {
+            return Ok(false);
+        }
+        let bound = self.store.lock().unwrap_or_else(|e| e.into_inner()).bind_token(&c.token, space).map_err(|e| HubError::Internal(e.to_string()))?;
+        c.spaces.retain(|s, _| bound.as_deref() == Some(s));
+        Ok(true)
+    }
+
     pub fn unregister(&self, id: ConnId) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(c) = g.conns.remove(&id) else { return };
@@ -675,6 +688,30 @@ mod tests {
 
     fn user() -> User {
         User { id: "a".into(), name: "A".into(), color: "#000".into() }
+    }
+
+    /// Ungebundenes Gerät: Der erste Zugriff legt den Vault fest, danach ist der andere Vault der Person tabu.
+    #[test]
+    fn device_binds_to_first_vault() {
+        let h = hub();
+        let token = {
+            let st = h.store.lock().unwrap();
+            st.add_space("zwei", "Zwei").unwrap();
+            st.set_member("zwei", "a", "write").unwrap();
+            crate::db::sha256_hex(st.issue_token("a", "d").unwrap().as_bytes())
+        };
+        let (tx, _rx) = mpsc::channel(100);
+        let spaces = HashMap::from([("sp".to_string(), "write".to_string()), ("zwei".to_string(), "write".to_string())]);
+        let c = h.register(tx, user(), "d".into(), token, spaces, Default::default());
+        let step1 = StateVector::default().encode_v1();
+        assert!(!h.bind_conn(c, "fremd").unwrap(), "ohne Zugriff keine Bindung");
+        h.on_sync(c, "zwei/x", codec::STEP1, &step1).unwrap();
+        assert!(h.bind_conn(c, "sp").unwrap());
+        h.on_sync(c, "sp/x", codec::STEP1, &step1).unwrap();
+        assert!(matches!(h.on_sync(c, "zwei/y", codec::STEP1, &step1), Err(HubError::Forbidden)));
+        assert!(matches!(h.on_catchup(c, "zwei", 0), Err(HubError::Forbidden)));
+        assert_eq!(h.online(Some("zwei")).len(), 0, "zählt nicht mehr als online im anderen Vault");
+        assert_eq!(h.online(Some("sp")).len(), 1);
     }
 
     #[test]

@@ -102,6 +102,11 @@ impl Store {
         if !has_e2ee {
             conn.execute_batch("ALTER TABLE spaces ADD COLUMN e2ee TEXT")?;
         }
+        // Migration 0.6: Geräte gehören zu genau einem Vault (NULL = noch nicht gebunden, bindet sich beim ersten Verbinden).
+        let has_token_space: bool = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('tokens') WHERE name = 'space'", [], |r| r.get::<_, i64>(0))? > 0;
+        if !has_token_space {
+            conn.execute_batch("ALTER TABLE tokens ADD COLUMN space TEXT; ALTER TABLE invites ADD COLUMN space TEXT;")?;
+        }
         Ok(Self { conn })
     }
 
@@ -217,26 +222,33 @@ impl Store {
 
     // ── Tokens & Einladungen ─────────────────────────────────────────
 
-    pub fn create_invite(&self, user: &str, hours: i64) -> Result<String> {
+    /// Einladung erzeugen. Mit `space` gilt das eingelöste Gerät nur für diesen Vault,
+    /// ohne bindet es sich beim ersten Verbinden an den Vault, den es öffnet.
+    pub fn create_invite(&self, user: &str, hours: i64, space: Option<&str>) -> Result<String> {
         if self.user(user)?.is_none() {
             bail!("Nutzer {user} nicht gefunden");
         }
+        if let Some(s) = space {
+            if self.role(s, user)?.is_none() {
+                bail!("{user} hat keinen Zugriff auf den Vault {s}");
+            }
+        }
         let code = invite_code();
         self.conn.execute(
-            "INSERT INTO invites (hash, user_id, expires) VALUES (?1, ?2, ?3)",
-            params![sha256_hex(normalize_code(&code).as_bytes()), user, now() + hours * 3600],
+            "INSERT INTO invites (hash, user_id, expires, space) VALUES (?1, ?2, ?3, ?4)",
+            params![sha256_hex(normalize_code(&code).as_bytes()), user, now() + hours * 3600, space],
         )?;
         Ok(code)
     }
 
-    /// Einladung einlösen → neues Geräte-Token (Klartext nur hier sichtbar).
-    pub fn redeem(&self, code: &str, device: &str) -> Result<(String, User)> {
+    /// Einladung einlösen → neues Geräte-Token (Klartext nur hier sichtbar) samt Person und Vault der Einladung.
+    pub fn redeem(&self, code: &str, device: &str) -> Result<(String, User, Option<String>)> {
         let hash = sha256_hex(normalize_code(code).as_bytes());
-        let row: Option<(String, i64, i64)> = self
+        let row: Option<(String, i64, i64, Option<String>)> = self
             .conn
-            .query_row("SELECT user_id, expires, used FROM invites WHERE hash = ?1", [&hash], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_row("SELECT user_id, expires, used, space FROM invites WHERE hash = ?1", [&hash], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .optional()?;
-        let Some((user_id, expires, used)) = row else { bail!("Code ungültig") };
+        let Some((user_id, expires, used, space)) = row else { bail!("Code ungültig") };
         if used != 0 || expires < now() {
             bail!("Code abgelaufen oder schon benutzt");
         }
@@ -244,11 +256,11 @@ impl Store {
         let device: String = device.chars().take(64).collect();
         self.conn.execute("UPDATE invites SET used = 1 WHERE hash = ?1", [&hash])?;
         self.conn.execute(
-            "INSERT INTO tokens (hash, user_id, device, created) VALUES (?1, ?2, ?3, ?4)",
-            params![sha256_hex(token.as_bytes()), user_id, device, now()],
+            "INSERT INTO tokens (hash, user_id, device, created, space) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![sha256_hex(token.as_bytes()), user_id, device, now(), space],
         )?;
         let user = self.user(&user_id)?.ok_or_else(|| anyhow!("Nutzer fehlt"))?;
-        Ok((token, user))
+        Ok((token, user, space))
     }
 
     /// Noch nicht eingelösten Einladungscode einer anderen Person zuordnen.
@@ -279,24 +291,56 @@ impl Store {
         Ok(token)
     }
 
-    pub fn auth(&self, token: &str) -> Result<Option<User>> {
+    /// Token prüfen → Person und der Vault, an den das Gerät gebunden ist (None = noch keiner).
+    pub fn auth(&self, token: &str) -> Result<Option<(User, Option<String>)>> {
         if token.is_empty() || token.len() > 256 {
             return Ok(None);
         }
         let hash = sha256_hex(token.as_bytes());
-        let uid: Option<String> = self
+        let row: Option<(String, Option<String>)> = self
             .conn
-            .query_row("SELECT user_id FROM tokens WHERE hash = ?1 AND revoked = 0", [&hash], |r| r.get(0))
+            .query_row("SELECT user_id, space FROM tokens WHERE hash = ?1 AND revoked = 0", [&hash], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        let Some(uid) = uid else { return Ok(None) };
+        let Some((uid, space)) = row else { return Ok(None) };
         self.conn.execute("UPDATE tokens SET last_seen = ?1 WHERE hash = ?2", params![now(), hash])?;
-        self.user(&uid)
+        Ok(self.user(&uid)?.map(|u| (u, space)))
     }
 
-    pub fn tokens(&self) -> Result<Vec<(String, String, String, i64, Option<i64>, bool)>> {
-        let mut st = self.conn.prepare("SELECT substr(hash,1,12), user_id, device, created, last_seen, revoked FROM tokens ORDER BY created")?;
+    /// Noch ungebundenes Gerät an einen Vault binden. Liefert die danach gültige Bindung.
+    pub fn bind_token(&self, hash: &str, space: &str) -> Result<Option<String>> {
+        self.conn.execute("UPDATE tokens SET space = ?2 WHERE hash = ?1 AND space IS NULL", params![hash, space])?;
+        Ok(self.conn.query_row("SELECT space FROM tokens WHERE hash = ?1", [hash], |r| r.get(0)).optional()?.flatten())
+    }
+
+    /// Den im Plugin gewählten Gerätenamen übernehmen.
+    pub fn rename_token(&self, hash: &str, device: &str) -> Result<()> {
+        if !device.is_empty() {
+            self.conn.execute("UPDATE tokens SET device = ?2 WHERE hash = ?1 AND device <> ?2", params![hash, device])?;
+        }
+        Ok(())
+    }
+
+    /// Gerät von Hand einem Vault zuordnen (nur Vaults, auf die die Person Zugriff hat). Liefert den vollen Hash zum Trennen.
+    pub fn assign_device(&self, id: &str, space: &str) -> Result<String> {
+        if id.len() != 12 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("Kennung ungültig");
+        }
+        let rows: Vec<(String, String)> = {
+            let mut st = self.conn.prepare("SELECT hash, user_id FROM tokens WHERE substr(hash,1,12) = ?1")?;
+            st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+        };
+        let [(hash, user)] = rows.as_slice() else { bail!("Gerät nicht eindeutig gefunden") };
+        if self.role(space, user)?.is_none() {
+            bail!("{user} hat keinen Zugriff auf diesen Vault");
+        }
+        self.conn.execute("UPDATE tokens SET space = ?2 WHERE hash = ?1", params![hash, space])?;
+        Ok(hash.clone())
+    }
+
+    pub fn tokens(&self) -> Result<Vec<(String, String, String, Option<String>, i64, Option<i64>, bool)>> {
+        let mut st = self.conn.prepare("SELECT substr(hash,1,12), user_id, device, space, created, last_seen, revoked FROM tokens ORDER BY created")?;
         let v = st
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0)))?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get::<_, i64>(6)? != 0)))?
             .collect::<Result<_, _>>()?;
         Ok(v)
     }
@@ -466,18 +510,18 @@ impl Store {
         Ok(())
     }
 
-    /// Mitglieder eines Space mit ihren (nicht gesperrten) Geräten.
+    /// Mitglieder eines Space mit ihren (nicht gesperrten) Geräten dieses Space.
     pub fn members(&self, space: &str) -> Result<Vec<serde_json::Value>> {
         let mut st = self.conn.prepare(
             "SELECT u.id, u.name, u.color, m.role FROM members m JOIN users u ON u.id = m.user_id WHERE m.space = ?1 ORDER BY u.name",
         )?;
         let rows: Vec<(String, String, String, String)> =
             st.query_map([space], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
-        let mut dev = self.conn.prepare("SELECT device, last_seen FROM tokens WHERE user_id = ?1 AND revoked = 0 ORDER BY created")?;
+        let mut dev = self.conn.prepare("SELECT device, last_seen FROM tokens WHERE user_id = ?1 AND revoked = 0 AND (space IS NULL OR space = ?2) ORDER BY created")?;
         let mut out = Vec::new();
         for (id, name, color, role) in rows {
             let devices: Vec<serde_json::Value> = dev
-                .query_map([&id], |r| Ok(serde_json::json!({ "device": r.get::<_, String>(0)?, "lastSeen": r.get::<_, Option<i64>>(1)? })))?
+                .query_map(params![&id, space], |r| Ok(serde_json::json!({ "device": r.get::<_, String>(0)?, "lastSeen": r.get::<_, Option<i64>>(1)? })))?
                 .collect::<Result<_, _>>()?;
             out.push(serde_json::json!({ "id": id, "name": name, "color": color, "role": role, "devices": devices }));
         }
@@ -784,11 +828,13 @@ impl Store {
         Ok(())
     }
 
-    /// Space samt Docs, Verlauf und Blob-Metadaten löschen (die Blob-Dateien löscht der Aufrufer).
+    /// Space samt Docs, Verlauf, Blob-Metadaten und seinen Geräten löschen (die Blob-Dateien löscht der Aufrufer).
     pub fn delete_space(&mut self, id: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
         let prefix = format!("{id}/");
         let n = prefix.chars().count() as i64;
+        tx.execute("DELETE FROM tokens WHERE space = ?1", [id])?;
+        tx.execute("DELETE FROM invites WHERE space = ?1", [id])?;
         tx.execute("DELETE FROM updates WHERE substr(doc, 1, ?2) = ?1", params![prefix, n])?;
         tx.execute("DELETE FROM snapshots WHERE substr(doc, 1, ?2) = ?1", params![prefix, n])?;
         tx.execute("DELETE FROM docs WHERE space = ?1", [id])?;
@@ -812,11 +858,11 @@ impl Store {
 
     /// Geräte (Tokens) eines Nutzers.
     pub fn devices(&self, user: &str) -> Result<Vec<serde_json::Value>> {
-        let mut st = self.conn.prepare("SELECT substr(hash,1,12), device, created, last_seen, revoked FROM tokens WHERE user_id = ?1 ORDER BY created")?;
+        let mut st = self.conn.prepare("SELECT substr(hash,1,12), device, created, last_seen, revoked, space FROM tokens WHERE user_id = ?1 ORDER BY created")?;
         let v = st
             .query_map([user], |r| {
                 Ok(serde_json::json!({ "id": r.get::<_, String>(0)?, "device": r.get::<_, String>(1)?, "created": r.get::<_, i64>(2)?,
-                    "lastSeen": r.get::<_, Option<i64>>(3)?, "revoked": r.get::<_, i64>(4)? != 0 }))
+                    "lastSeen": r.get::<_, Option<i64>>(3)?, "revoked": r.get::<_, i64>(4)? != 0, "space": r.get::<_, Option<String>>(5)? }))
             })?
             .collect::<Result<_, _>>()?;
         Ok(v)
@@ -989,21 +1035,91 @@ mod tests {
         s.add_user("anna", "Anna", None).unwrap();
         s.add_space("schule", "Schule").unwrap();
         s.set_member("schule", "anna", "write").unwrap();
-        let code = s.create_invite("anna", 1).unwrap();
-        let (tok, u) = s.redeem(&code.to_lowercase(), "Laptop").unwrap();
+        let code = s.create_invite("anna", 1, None).unwrap();
+        let (tok, u, _) = s.redeem(&code.to_lowercase(), "Laptop").unwrap();
         assert_eq!(u.id, "anna");
         assert!(s.redeem(&code, "x").is_err(), "Code nur einmal");
         s.add_user("nico", "Nico", None).unwrap();
-        let c2 = s.create_invite("anna", 1).unwrap();
+        let c2 = s.create_invite("anna", 1, None).unwrap();
         s.move_invite(&c2, "nico").unwrap();
         assert_eq!(s.redeem(&c2, "Tablet").unwrap().1.id, "nico");
         assert!(s.move_invite(&c2, "anna").is_err(), "eingelöste Codes nicht umhängen");
-        assert_eq!(s.auth(&tok).unwrap().unwrap().id, "anna");
+        assert_eq!(s.auth(&tok).unwrap().unwrap().0.id, "anna");
         assert!(s.auth("falsch").unwrap().is_none());
         let prefix = sha256_hex(tok.as_bytes())[..12].to_string();
         assert_eq!(s.revoke(&prefix).unwrap(), 1);
         assert!(s.auth(&tok).unwrap().is_none());
         assert_eq!(s.spaces_of("anna").unwrap()[0].role, "write");
+    }
+
+    /// Zwei Vaults auf demselben Rechner: zwei Geräte-Einträge, jeder gehört genau einem Vault.
+    #[test]
+    fn devices_belong_to_one_vault() {
+        let mut s = mem();
+        s.add_user("anna", "Anna", None).unwrap();
+        for sp in ["schule", "rust"] {
+            s.add_space(sp, sp).unwrap();
+            s.set_member(sp, "anna", "owner").unwrap();
+        }
+        s.add_space("fremd", "Fremd").unwrap();
+        assert!(s.create_invite("anna", 1, Some("fremd")).is_err(), "nur Vaults mit Zugriff");
+
+        // Code für einen Vault → Gerät ist sofort gebunden
+        let (t1, _, sp1) = s.redeem(&s.create_invite("anna", 1, Some("schule")).unwrap(), "Desktop").unwrap();
+        assert_eq!(sp1.as_deref(), Some("schule"));
+        assert_eq!(s.auth(&t1).unwrap().unwrap().1.as_deref(), Some("schule"));
+
+        // Altes/ungebundenes Gerät bindet sich einmalig
+        let t2 = s.issue_token("anna", "Desktop").unwrap();
+        let h2 = sha256_hex(t2.as_bytes());
+        assert_eq!(s.auth(&t2).unwrap().unwrap().1, None);
+        assert_eq!(s.bind_token(&h2, "rust").unwrap().as_deref(), Some("rust"));
+        assert_eq!(s.bind_token(&h2, "schule").unwrap().as_deref(), Some("rust"), "Bindung bleibt");
+
+        // Geräteliste und Mitgliederliste trennen nach Vault
+        let devs = s.devices("anna").unwrap();
+        assert_eq!(devs.iter().filter(|d| d["space"] == "schule").count(), 1);
+        assert_eq!(devs.iter().filter(|d| d["space"] == "rust").count(), 1);
+        assert_eq!(s.members("rust").unwrap()[0]["devices"].as_array().unwrap().len(), 1);
+
+        // Name aus dem Plugin wird übernommen
+        s.rename_token(&h2, "Desktop (Rust)").unwrap();
+        assert!(s.devices("anna").unwrap().iter().any(|d| d["device"] == "Desktop (Rust)"));
+        s.rename_token(&h2, "").unwrap();
+        assert!(s.devices("anna").unwrap().iter().any(|d| d["device"] == "Desktop (Rust)"), "leerer Name ändert nichts");
+
+        // Von Hand zuordnen: nur mit Zugriff
+        let t3 = s.issue_token("anna", "Tablet").unwrap();
+        let id3 = sha256_hex(t3.as_bytes())[..12].to_string();
+        assert!(s.assign_device(&id3, "fremd").is_err());
+        s.assign_device(&id3, "schule").unwrap();
+        assert_eq!(s.auth(&t3).unwrap().unwrap().1.as_deref(), Some("schule"));
+
+        // Vault gelöscht → seine Geräte und offenen Codes sind weg, die des anderen Vaults bleiben
+        let offen = s.create_invite("anna", 1, Some("rust")).unwrap();
+        s.delete_space("rust").unwrap();
+        assert!(s.auth(&t2).unwrap().is_none());
+        assert!(s.redeem(&offen, "x").is_err());
+        assert!(s.auth(&t1).unwrap().is_some());
+    }
+
+    /// Bestehende Datenbanken bekommen die Spalten, vorhandene Geräte bleiben gültig und ungebunden.
+    #[test]
+    fn migration_keeps_tokens() {
+        let dir = std::env::temp_dir().join(format!("tandem-mig-{}", random_token(6)));
+        let path = dir.join("t.db");
+        let tok = {
+            let s = Store::open(&path).unwrap();
+            s.add_user("anna", "Anna", None).unwrap();
+            let t = s.issue_token("anna", "Laptop").unwrap();
+            s.conn.execute_batch("ALTER TABLE tokens DROP COLUMN space; ALTER TABLE invites DROP COLUMN space;").unwrap();
+            t
+        };
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.auth(&tok).unwrap().unwrap().1, None);
+        drop(s);
+        Store::open(&path).unwrap(); // zweites Öffnen migriert nicht erneut
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

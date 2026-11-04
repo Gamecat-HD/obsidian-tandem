@@ -1509,7 +1509,7 @@ async function deleteVault(s, after) {
   if (members.length) facts.push(h('dt', { text: 'Mitglieder' }), h('dd', { text: members.map((m) => m.name || m.id).join(', ') }));
   if (Number(s.online) > 0) facts.push(h('dt', { text: 'Verbunden' }), h('dd', { text: plural(s.online, 'Gerät wird getrennt', 'Geräte werden getrennt') }));
   const ok = await typedConfirm('Vault löschen', frag(
-    h('p', {}, h('strong', { text: esc(s.name || s.id) }), ' wird mit allen Notizen und dem gesamten Verlauf vom Server gelöscht. Ältere Sicherungen behalten ihren Stand, die Anhänge bleiben dafür erhalten.'),
+    h('p', {}, h('strong', { text: esc(s.name || s.id) }), ' wird mit allen Notizen, dem gesamten Verlauf und den Geräte-Zugängen dieses Vaults vom Server gelöscht. Ältere Sicherungen behalten ihren Stand, die Anhänge bleiben dafür erhalten.'),
     facts.length ? h('dl', { class: 'kv compact' }, facts) : null,
     h('p', {}, h('button', { class: 'linkish', type: 'button', text: 'Vorher exportieren (.tar)', onclick: () => exportVault(s.id) })),
   ), s.id, 'Endgültig löschen');
@@ -1753,17 +1753,58 @@ function personDetails(u, spaces, reload, { who, isMe, devices, memberships }) {
     addRow,
     memberships.length ? h('p', { class: 'dim small', text: ROLE_HINT }) : null);
 
-  // --- Geräte (gestapelte Zeilen, keine Querscroll-Tabelle)
+  // --- Geräte je Vault (gestapelte Zeilen, keine Querscroll-Tabelle)
+  const groups = new Map(memberships.map((s) => [s.id, []]));
+  const loose = [];
+  for (const d of devices) {
+    if (!d.space) { loose.push(d); continue; }
+    if (!groups.has(d.space)) groups.set(d.space, []);
+    groups.get(d.space).push(d);
+  }
+  const targets = memberships.map((s) => ({ id: s.id, name: s.name || s.id }));
+  const blocks = [...groups].filter(([, list]) => list.length).map(([id, list]) => {
+    const noAccess = !memberIds.has(id);
+    return h('div', { class: 'device-group' },
+      h('h4', {},
+        h('a', { class: 'plain-link', href: `#/vault/${enc(id)}/_devices`, text: esc(spaceName(id, spaces)) }),
+        noAccess ? h('span', { class: 'warn-text small', text: ' · kein Zugriff mehr' }) : null),
+      deviceList(list, u, reload));
+  });
+  if (loose.length) blocks.push(looseDevices(loose, u, reload, targets));
   const devSection = h('section', { class: 'person-section', 'aria-label': `Geräte von ${who}` },
     h('h3', { text: `Geräte (${fmtNum(devices.length)})` }),
-    devices.length
-      ? h('ul', { class: 'devices' }, devices.slice().sort((a, b) => (b.online - a.online) || (a.revoked - b.revoked) || (Number(b.lastSeen) || 0) - (Number(a.lastSeen) || 0)).map((d) => deviceRow(d, u, reload)))
-      : h('p', { class: 'dim small', text: 'Noch kein Gerät verbunden – mit „Gerät einladen“ einen Code erzeugen.' }));
+    blocks.length ? blocks : h('p', { class: 'dim small', text: 'Noch kein Gerät verbunden – mit „Gerät einladen“ einen Code erzeugen.' }));
 
   return h('div', { class: 'person-grid' }, vaultsSection, devSection);
 }
 
-function deviceRow(d, u, reload) {
+function deviceList(list, u, reload, opts) {
+  return h('ul', { class: 'devices' }, list.slice().sort((a, b) => (b.online - a.online) || (a.revoked - b.revoked) || (Number(b.lastSeen) || 0) - (Number(a.lastSeen) || 0)).map((d) => deviceRow(d, u, reload, opts)));
+}
+
+// Geräte ohne Vault: alte Zugänge, die sich noch nicht verbunden haben, und Dienste über die Lese-API
+function looseDevices(list, u, reload, targets) {
+  return h('div', { class: 'device-group' },
+    h('h4', { text: 'Noch keinem Vault zugeordnet' }),
+    h('p', { class: 'dim small', text: 'Ordnet sich beim nächsten Verbinden aus Obsidian dem geöffneten Vault zu. Bis dahin gilt der Zugang für alle Vaults der Person.' }),
+    deviceList(list, u, reload, { targets }));
+}
+
+// Einem Vault zuordnen: bei einem möglichen Vault nur ein Knopf, sonst Auswahl plus Knopf
+function assignControls(d, name, reload, targets) {
+  if (d.revoked || !targets || !targets.length) return [];
+  const sel = targets.length > 1 ? h('select', { class: 'select sm', 'aria-label': `Vault für ${name}` }, targets.map((t) => h('option', { value: t.id, text: esc(t.name) }))) : null;
+  const btn = h('button', { class: 'btn sm', type: 'button', text: sel ? 'Zuordnen' : `„${esc(targets[0].name)}“ zuordnen`, 'aria-label': sel ? `${name} dem gewählten Vault zuordnen` : null, dataset: { key: 'dev:' + d.id } });
+  btn.addEventListener('click', () => busy(btn, async () => {
+    const target = sel ? targets.find((t) => t.id === sel.value) : targets[0];
+    await api(`devices/${enc(d.id)}/space`, { method: 'POST', body: { space: target.id } });
+    toast(`„${name}“ gehört jetzt zu „${esc(target.name)}“`, 'ok');
+    await reload('dev:' + d.id);
+  }));
+  return sel ? [sel, btn] : [btn];
+}
+
+function deviceRow(d, u, reload, opts) {
   const name = esc(d.device) || 'Gerät ohne Namen';
   const who = esc(u.name || u.id);
   const key = 'dev:' + d.id;
@@ -1771,13 +1812,13 @@ function deviceRow(d, u, reload) {
     : d.online ? h('span', { class: 'ok-text', text: `online${d.rttMs != null ? ' · ' + fmtMs(d.rttMs) : ''}`, title: d.rttMs != null ? 'Ping-Laufzeit gerade' : null })
     : d.lastSeen == null ? h('span', { class: 'dim', text: 'noch nie verbunden' })
     : h('span', { class: deviceStale(d) ? 'warn-text' : 'dim' }, 'zuletzt verbunden ', timeEl(d.lastSeen));
-  const actions = [];
+  const actions = assignControls(d, name, reload, opts && opts.targets);
   if (d.revoked) {
     const un = h('button', { class: 'btn sm', type: 'button', text: 'Sperre aufheben', 'aria-label': `Sperre von ${name} aufheben`, dataset: { key } });
     un.addEventListener('click', () => busy(un, async () => { await api(`devices/${enc(d.id)}/unrevoke`, { method: 'POST' }); toast(`„${name}“ kann sich wieder verbinden`, 'ok'); await reload(key); }));
     actions.push(un);
   }
-  const del = h('button', { class: 'btn sm', type: 'button', text: 'Entfernen', 'aria-label': `${name} entfernen`, dataset: d.revoked ? null : { key } });
+  const del = h('button', { class: 'btn sm', type: 'button', text: 'Entfernen', 'aria-label': `${name} entfernen`, dataset: d.revoked || actions.length ? null : { key } });
   del.addEventListener('click', async () => {
     const msg = d.revoked
       ? `Der gesperrte Eintrag „${name}“ von ${who} wird endgültig entfernt.`
@@ -1895,8 +1936,8 @@ async function userDialog(u, spaces) {
   return { id: res.id, invite: next === 'invite' };
 }
 
-// Einladungscode; ohne Vault-Zugriff vorher einen Vault zuweisen lassen
-async function inviteDialog(u, spaces, reload) {
+// Einladungscode für genau einen Vault; ohne Vault-Zugriff vorher einen Vault zuweisen lassen
+async function inviteDialog(u, spaces, reload, opts = {}) {
   const who = esc(u.name || u.id);
   let memberships = Array.isArray(u.spaces) ? u.spaces.slice() : [];
   let changed = false;
@@ -1906,6 +1947,9 @@ async function inviteDialog(u, spaces, reload) {
   const space = h('select', { class: 'select', id: 'inv-space' }, spaces.map((s) => h('option', { value: s.id, text: esc(s.name || s.id) })));
   const role = roleSelect('write'); role.id = 'inv-role';
   const needsVault = !memberships.length && spaces.length;
+  const fixed = memberships.find((m) => m.id === opts.space) || (memberships.length === 1 ? memberships[0] : null);
+  const vaultSel = !needsVault && !fixed && memberships.length ? h('select', { class: 'select', id: 'inv-vault' }, memberships.map((m) => h('option', { value: m.id, text: esc(m.name || m.id) }))) : null;
+  let target = fixed ? fixed.id : null;
   const choice = await openDialog({
     title: `Gerät für ${who} einladen`,
     body: frag(
@@ -1913,6 +1957,9 @@ async function inviteDialog(u, spaces, reload) {
         h('p', { class: 'warn-note' }, h('strong', { text: who }), ' hat noch keinen Vault-Zugriff. Ein Gerät könnte sich verbinden, sähe aber keine Dateien.'),
         h('div', { class: 'field' }, h('label', { for: 'inv-space', text: 'Vault' }), space),
         h('div', { class: 'field' }, h('label', { for: 'inv-role', text: 'Rolle' }), role)) : null,
+      vaultSel ? h('div', { class: 'field' }, h('label', { for: 'inv-vault', text: 'Vault' }), vaultSel) : null,
+      fixed ? h('p', {}, 'Der Code gilt für den Vault ', h('strong', { text: esc(fixed.name || fixed.id) }), '.') : null,
+      memberships.length || needsVault ? h('p', { class: 'dim small', text: 'Ein Gerät gehört zu einem Vault. Sollen auf einem Rechner zwei Vaults laufen, braucht jeder einen eigenen Code.' }) : null,
       h('div', { class: 'field' }, h('label', { for: 'inv-hours', text: 'Gültigkeit des Codes' }), hoursSel),
     ),
     buttons: [
@@ -1922,33 +1969,34 @@ async function inviteDialog(u, spaces, reload) {
         if (needsVault) {
           try { await setMember(space.value, u.id, role.value); } catch { return; }
           memberships = [{ id: space.value, name: spaceName(space.value, spaces), role: role.value }];
+          target = space.value;
           changed = true;
-        }
+        } else if (vaultSel) target = vaultSel.value;
         close('go');
       } },
     ].filter(Boolean),
-    onOpen: () => (needsVault ? space : hoursSel).focus(),
+    onOpen: () => (needsVault ? space : vaultSel || hoursSel).focus(),
   });
   if (choice == null) { if (changed) await reload(); return; }
   let r;
-  try { r = await api(`users/${enc(u.id)}/invite`, { method: 'POST', body: { hours: Number(hoursSel.value) } }); }
+  try { r = await api(`users/${enc(u.id)}/invite`, { method: 'POST', body: { hours: Number(hoursSel.value), space: target } }); }
   catch { if (changed) await reload(); return; }
   const code = esc(r && r.code);
   const hours = Number(r && r.hours) || Number(hoursSel.value);
   const server = location.origin;
-  const vaultIds = memberships.map((m) => m.id);
-  const guide = `Tandem einrichten:\n1. In Obsidian → Einstellungen → Tandem\n2. Server: ${server}\n3. Einladungscode: ${code} → „Einlösen“\n4. Space: ${vaultIds.join(' oder ') || '(noch kein Vault)'}\nDer Code gilt ${hours >= 48 ? Math.round(hours / 24) + ' Tage' : hours + ' Stunden'} und nur einmal.`;
+  const vault = memberships.find((m) => m.id === target);
+  const guide = `Tandem einrichten:\n1. Den Vault in Obsidian öffnen → Einstellungen → Tandem\n2. Server: ${server}\n3. Einladungscode: ${code} → „Einlösen“\n4. Space: ${target || '(noch kein Vault)'}${target ? ' (wird beim Einlösen eingetragen, wenn das Feld leer ist)' : ''}\nDer Code gilt ${hours >= 48 ? Math.round(hours / 24) + ' Tage' : hours + ' Stunden'} und nur einmal.`;
   await openDialog({
     title: `Einladungscode für ${who}`,
     body: frag(
       h('div', { class: 'code-big', text: code || '–' }),
       h('dl', { class: 'kv compact invite' },
         h('dt', { text: 'Server' }), h('dd', {}, h('code', { text: server })),
-        h('dt', { text: 'Space' }), h('dd', {}, memberships.length
-          ? memberships.map((m, i) => frag(i ? ', ' : null, h('code', { text: m.id }), h('span', { class: 'dim', text: ` (${(m.name || m.id).toLowerCase() === m.id ? '' : esc(m.name) + ' · '}${roleLabel(m.role)})` })))
+        h('dt', { text: 'Space' }), h('dd', {}, vault
+          ? frag(h('code', { text: vault.id }), h('span', { class: 'dim', text: ` (${(vault.name || vault.id).toLowerCase() === vault.id ? '' : esc(vault.name) + ' · '}${roleLabel(vault.role)})` }))
           : h('span', { class: 'warn-text', text: 'kein Vault – das Gerät sieht keine Dateien' })),
         h('dt', { text: 'Gültig' }), h('dd', { text: `${hours >= 48 ? Math.round(hours / 24) + ' Tage' : hours + ' Stunden'}, einmal einlösbar` })),
-      h('p', { class: 'dim small', text: 'In Obsidian unter Einstellungen → Tandem: Server eintragen, Code einlösen und als „Space“ die Vault-Kennung wählen.' }),
+      h('p', { class: 'dim small', text: vault ? 'Den Vault in Obsidian öffnen, unter Einstellungen → Tandem den Server eintragen und den Code einlösen. Ist das Feld „Space“ leer, wird es dabei ausgefüllt.' : 'In Obsidian unter Einstellungen → Tandem: Server eintragen und Code einlösen.' }),
     ),
     buttons: [
       { label: 'Anleitung kopieren', left: true, onClick: (_c, b) => copyText(guide, b) },
@@ -2039,6 +2087,7 @@ const ACTION_LABELS = {
   'invite': ['Einladungscode erzeugt', 'people'],
   'device.revoke': ['Gerät gesperrt', 'people'],
   'device.unrevoke': ['Sperre aufgehoben', 'people'],
+  'device.assign': ['Gerät einem Vault zugeordnet', 'people'],
   'device.delete': ['Gerät entfernt', 'people'],
   'device.cleanup': ['Geräte aufgeräumt', 'people'],
   'space.add': ['Vault angelegt', 'vaults'],
@@ -2392,9 +2441,9 @@ async function addPasskey(btn, reload) {
 }
 
 // ---------------------------------------------------------------------------
-// Vault-Detail: Baum, Editor, Vorschau, Mitglieder, Papierkorb, Sicherungen
+// Vault-Detail: Baum, Editor, Vorschau, Mitglieder, Geräte, Papierkorb, Sicherungen
 
-const VAULT_TABS = ['_members', '_trash', '_backups'];
+const VAULT_TABS = ['_members', '_devices', '_trash', '_backups'];
 
 function rawUrl(space, id, download) { return `${API}spaces/${enc(space)}/raw/${enc(id)}${download ? '?download=1' : ''}`; }
 
@@ -2448,7 +2497,7 @@ function createVaultCtx(space) {
   const e2eeSlot = h('span', { class: 'e2ee-slot' });
   const tabLink = (tab, text) => h('a', { href: `#/vault/${enc(space)}${tab ? '/' + tab : ''}`, dataset: { tab } }, h('span', { text }), h('span', { class: 'n' }));
   const tabs = h('nav', { class: 'tabs', 'aria-label': 'Vault-Bereiche' },
-    tabLink('', 'Dateien'), tabLink('_members', 'Mitglieder'), tabLink('_trash', 'Papierkorb'), tabLink('_backups', 'Sicherungen'));
+    tabLink('', 'Dateien'), tabLink('_members', 'Mitglieder'), tabLink('_devices', 'Geräte'), tabLink('_trash', 'Papierkorb'), tabLink('_backups', 'Sicherungen'));
   const drawerBtn = h('button', { class: 'btn drawer-btn', type: 'button', text: 'Ordner', 'aria-expanded': 'false', 'aria-controls': 'tree-' + space, onclick: () => toggleDrawer() });
   const newBtn = h('button', { class: 'btn', type: 'button', text: 'Neue Notiz', onclick: () => newNote(currentFolder()) });
   const upBtn = h('button', { class: 'btn', type: 'button', text: 'Hochladen', title: 'Dateien hochladen', onclick: () => uploadDialog(currentFolder()) });
@@ -2537,7 +2586,7 @@ function createVaultCtx(space) {
   }
   function updateTitle() {
     const vn = ctx.info && ctx.info.name ? ctx.info.name : space;
-    const tabName = { _members: 'Mitglieder', _trash: 'Papierkorb', _backups: 'Sicherungen' }[ctx.tab];
+    const tabName = { _members: 'Mitglieder', _devices: 'Geräte', _trash: 'Papierkorb', _backups: 'Sicherungen' }[ctx.tab];
     const dirty = ctx.ed && ctx.ed.ta.value !== ctx.ed.saved ? '● ' : '';
     document.title = `${dirty}${tabName ? tabName + ' – ' : (ctx.doc ? displayName(ctx.doc.path) + ' – ' : '')}${vn} – Tandem Admin`;
   }
@@ -2546,7 +2595,8 @@ function createVaultCtx(space) {
     const ms = members();
     membersPeek.hidden = !(ctx.info && !ms.length);
     const trashN = ctx.files.filter((f) => f && f.del).length;
-    const counts = { '': null, _members: ctx.info ? ms.length : null, _trash: ctx.filesLoaded ? trashN : null, _backups: null };
+    const deviceN = Array.isArray(ctx.users) ? ctx.users.reduce((n, u) => n + (u.devices || []).filter((d) => d.space === space).length, 0) : null;
+    const counts = { '': null, _members: ctx.info ? ms.length : null, _devices: deviceN, _trash: ctx.filesLoaded ? trashN : null, _backups: null };
     for (const a of tabs.children) {
       const n = counts[a.dataset.tab];
       a.querySelector('.n').textContent = n != null && n > 0 ? String(n) : '';
@@ -2591,6 +2641,7 @@ function createVaultCtx(space) {
     await Promise.all([ctx.loadInfo(), ctx.loadFiles().catch(() => {})]);
     if (ctx.notFound) return;
     if (ctx.tab === '_members') await renderMembers();
+    else if (ctx.tab === '_devices') await renderDevices();
     else if (ctx.tab === '_trash') renderTrash();
     else if (ctx.tab === '_backups') await renderBackupsTab();
     else if (ctx.doc && !ctx.filesError) {
@@ -2620,6 +2671,7 @@ function createVaultCtx(space) {
     if (ctx.tab !== '' || locked()) toggleDrawer(false);
     updateTitle();
     if (ctx.tab === '_members') { await renderMembers(); return; }
+    if (ctx.tab === '_devices') { await renderDevices(); return; }
     if (ctx.tab === '_trash') { renderTrash(); return; }
     if (ctx.tab === '_backups') { await renderBackupsTab(); return; }
     if (sub && locked()) {
@@ -3584,6 +3636,56 @@ function createVaultCtx(space) {
         h('div', { class: 'card-body' }, addRow, h('p', { class: 'dim small', text: ROLE_HINT }))),
     ));
     if (!ms.length) { const s = filePane.querySelector('#mem-add'); if (s) s.focus({ preventScroll: true }); }
+    renderHeadState();
+  }
+
+  // --- Geräte dieses Vaults, nach Person
+  async function renderDevices() {
+    if (!filePane.querySelector('.devices-page')) replace(filePane, loadingEl());
+    if (!ctx.info && !ctx.infoError) await ctx.loadInfo();
+    if (ctx.notFound) return;
+    if (!ctx.users) { try { ctx.users = await loadUsers(); } catch (e) { replace(filePane, h('div', { class: 'page' }, errorEl('Geräte konnten nicht geladen werden', e, () => ctx.reload()))); return; } }
+    if (ctx.tab !== '_devices') return;
+    if (!ctx.info) { replace(filePane, h('div', { class: 'page' }, errorEl('Geräte konnten nicht geladen werden', ctx.infoError, () => ctx.reload()))); return; }
+    const users = Array.isArray(ctx.users) ? ctx.users : [];
+    const ms = members();
+    const memberIds = new Set(ms.map((m) => m.id));
+    const meId = state.me && state.me.user ? state.me.user.id : null;
+    const vaultName = esc(ctx.info.name || space);
+    const reload = async (key) => {
+      ctx.users = await loadUsers();
+      await ctx.loadInfo();
+      await renderDevices();
+      refocus(filePane, key, filePane.querySelector('h2'));
+    };
+    const devicesOf = (u) => (Array.isArray(u.devices) ? u.devices : []);
+    const here = users.filter((u) => memberIds.has(u.id) || devicesOf(u).some((d) => d.space === space)).sort((a, b) => coll.compare(a.name || a.id, b.name || b.id));
+    let total = 0;
+    const groups = here.map((u) => {
+      const list = devicesOf(u).filter((d) => d.space === space);
+      total += list.length;
+      const member = memberIds.has(u.id);
+      const name = esc(u.name || u.id);
+      return h('div', { class: 'device-group' },
+        h('div', { class: 'device-group-head' },
+          h('a', { class: 'plain-link', href: `#/users/${enc(u.id)}` }, colorDot(u.color), h('strong', { text: name })),
+          u.id === meId ? h('span', { class: 'badge', text: 'du' }) : null,
+          member ? null : h('span', { class: 'warn-text small', text: 'kein Zugriff mehr' }),
+          member ? h('button', { class: 'btn sm', type: 'button', text: 'Gerät einladen', 'aria-label': `Gerät für ${name} einladen`, dataset: { key: 'inv:' + u.id }, onclick: (e) => busy(e.currentTarget, () => inviteDialog(u, [], reload, { space })) }) : null),
+        list.length ? deviceList(list, u, reload) : h('p', { class: 'dim small', text: 'Noch kein Gerät in diesem Vault.' }));
+    });
+    const loose = here.filter((u) => memberIds.has(u.id) && devicesOf(u).some((d) => !d.space));
+    replace(filePane, h('div', { class: 'page devices-page' },
+      h('section', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h2', { text: `Geräte (${fmtNum(total)})`, tabindex: '-1' })),
+        h('div', { class: 'card-body' },
+          h('p', { class: 'dim small', text: `Jedes Gerät hier gilt nur für „${vaultName}“. Läuft auf einem Rechner noch ein zweiter Vault, steht er dort als eigenes Gerät.` }),
+          groups.length ? groups : h('p', { class: 'warn-note' }, 'Noch niemand hat Zugriff auf diesen Vault. ', h('a', { href: `#/vault/${enc(space)}/_members`, text: 'Mitglieder hinzufügen' })))),
+      loose.length ? h('section', { class: 'card' },
+        h('div', { class: 'card-body' }, loose.map((u) => {
+          const list = devicesOf(u).filter((d) => !d.space);
+          return frag(loose.length > 1 ? h('p', { class: 'small' }, h('strong', { text: esc(u.name || u.id) })) : null, looseDevices(list, u, reload, [{ id: space, name: ctx.info.name || space }]));
+        }))) : null));
     renderHeadState();
   }
 

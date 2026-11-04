@@ -53,7 +53,7 @@ Alle Antworten sind JSON, Fehler haben die Form `{"error": "Meldung auf Deutsch"
 | Methode | Pfad | Antwort |
 |---|---|---|
 | GET | `/admin/api/overview` | `{version, rssKib, dbBytes, store:{users,spaces,docs,update_rows,update_bytes,snapshots,blobs,blob_bytes}, online:[Online], admins:[{user,created,lastLogin}]}` |
-| GET | `/admin/api/audit?before=<id>&user=&action=&q=&since=` | `[{id, ts, user, ip, action, detail}]` (neueste zuerst, 100 pro Seite). Filter: `user` (exakt), `action` (Präfix, z. B. `file.` oder `login.failed`), `q` (Text in `detail`, ohne Groß/klein), `since` (Unix-s). Aktionen: `login`, `login.failed` (`user` = eingegebene Kennung, nicht unbedingt eine echte Person), `logout`, `admin.setup`, `sessions.end`, `user.add/edit/delete`, `invite`, `device.revoke/unrevoke/delete/cleanup`, `space.add/rename/delete`, `member.set/remove`, `file.create/edit/upload/move/delete/undelete/restore`, `backup.create/delete/settings/download/restore`, `export` |
+| GET | `/admin/api/audit?before=<id>&user=&action=&q=&since=` | `[{id, ts, user, ip, action, detail}]` (neueste zuerst, 100 pro Seite). Filter: `user` (exakt), `action` (Präfix, z. B. `file.` oder `login.failed`), `q` (Text in `detail`, ohne Groß/klein), `since` (Unix-s). Aktionen: `login`, `login.failed` (`user` = eingegebene Kennung, nicht unbedingt eine echte Person), `logout`, `admin.setup`, `sessions.end`, `user.add/edit/delete`, `invite`, `device.revoke/unrevoke/assign/delete/cleanup`, `space.add/rename/delete`, `member.set/remove`, `file.create/edit/upload/move/delete/undelete/restore`, `backup.create/delete/settings/download/restore`, `export` |
 
 `Online` = `{user, name, color, device, token, deviceId, docs:["space/docId", …], files:[{space, doc, path}] (geöffnete Dateien ohne den Index; path null, wenn gelöscht), rttMs, bytesIn, bytesOut, updates, since}`
 
@@ -112,15 +112,20 @@ Die Wiederherstellung läuft wie jede Admin-Änderung über den Hub. Verbundene 
 
 ### Personen und Geräte
 
+Ein Gerät (Token) gehört zu genau einem Vault, weil Anmeldung und Plugin-Einstellungen in Obsidian je Vault getrennt liegen. Zwei Vaults auf einem Rechner sind also zwei Einträge. Verwaltet werden sie im Vault unter „Geräte“ oder bei der Person, dort nach Vault gruppiert. Das Token kommt nur an seinen Vault (WebSocket und HTTP), Vault-Mitgliedschaft der Person vorausgesetzt.
+
+Ein Token ohne Vault (vor 0.6 ausgestellt oder per `token issue`) bindet sich beim ersten Zugriff über den WebSocket an den geöffneten Vault. Rein über die Lese-API genutzte Tokens bleiben ungebunden und gelten für alle Vaults der Person, bis sie von Hand zugeordnet werden. Wird ein Vault gelöscht, verschwinden seine Geräte und offenen Einladungscodes mit.
+
 | Methode | Pfad | Body → Antwort |
 |---|---|---|
-| GET | `/admin/api/users` | → `[{id, name, color, admin, spaces:[{id,name,role}], devices:[{id, device, created, lastSeen, revoked, online, rttMs}]}]` |
+| GET | `/admin/api/users` | → `[{id, name, color, admin, spaces:[{id,name,role}], devices:[{id, device, space, created, lastSeen, revoked, online, rttMs}]}]` (`space` = Vault des Geräts, null = noch keiner) |
 | POST | `/admin/api/users` | `{id, name, color?}` → User (409, wenn es die Kennung schon gibt) |
 | PATCH | `/admin/api/users/{id}` | `{name?, color?}` → 204 |
 | DELETE | `/admin/api/users/{id}` | → 204 (nicht sich selbst) |
-| POST | `/admin/api/users/{id}/invite` | `{hours?}` → `{code, hours}` |
+| POST | `/admin/api/users/{id}/invite` | `{hours?, space?}` → `{code, hours, space}` (mit `space` gilt das Gerät nur für diesen Vault; 400 ohne Zugriff der Person) |
 | POST | `/admin/api/devices/{deviceId}/revoke` | → 204 (Gerät wird sofort getrennt) |
 | POST | `/admin/api/devices/{deviceId}/unrevoke` | → 204 (Sperre aufheben) |
+| POST | `/admin/api/devices/{deviceId}/space` | `{space}` → 204 (Gerät einem Vault zuordnen, verbindet sich neu; 400 ohne Zugriff der Person) |
 | DELETE | `/admin/api/devices/{deviceId}` | → 204 (Gerät endgültig entfernen, wird sofort getrennt) |
 | POST | `/admin/api/devices/cleanup` | `{revoked?: bool, inactiveDays?: n}` → `{removed}` (gesperrte und/oder seit n Tagen ungenutzte Geräte entfernen; gerade verbundene, nicht gesperrte bleiben) |
 

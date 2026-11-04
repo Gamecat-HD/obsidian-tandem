@@ -167,10 +167,12 @@ In der Statusleiste steht danach **„Tandem online“** mit den Avataren der an
 
 **Am einfachsten in Obsidian:** Einstellungen → Tandem → **Personen und Geräte**. Besitzer erzeugen dort Codes für eigene weitere Geräte und laden neue Personen ein (Kennung, Name, Rolle).
 
+**Ein Gerät gehört zu einem Vault.** Ein zweiter Vault auf demselben Rechner braucht einen eigenen Code und steht in der Admin-Oberfläche als eigener Eintrag unter diesem Vault.
+
 **Oder per Kommandozeile:**
 
 ```bash
-docker exec tandem /tandem-server invite anna                       # weiteres Gerät für Anna
+docker exec tandem /tandem-server invite anna --space schule        # weiteres Gerät für Anna, gilt nur für diesen Vault
 docker exec tandem /tandem-server user add ben "Ben"                 # neue Person
 docker exec tandem /tandem-server space member notizen ben write     # owner | write | read
 docker exec tandem /tandem-server invite ben                         # Code für Ben
