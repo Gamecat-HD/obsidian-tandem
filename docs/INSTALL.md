@@ -231,5 +231,6 @@ Wer per Portainer-API deployt: [`deploy/redeploy.sh`](../deploy/redeploy.sh) bau
 | Cloudflare-Fehler 525 | Proxy-Host oder Zertifikat am Ursprungsserver fehlt. |
 | „Code ungültig oder abgelaufen“ | Codes gelten 72 h und nur einmal → neuen erzeugen. |
 | Große Anhänge brechen ab | Upload-Limit im Proxy (`client_max_body_size 0` bei Nginx). |
+| App stürzt beim Abgleich ab (Android) | Sehr große Anhänge (ab etwa 50 MB) sprengen dort den Speicher. Tandem überspringt die Datei danach und meldet das; erneut versuchen unter Einstellungen → Tandem. |
 | Container startet neu (OOM) | Server < 0.3.1 hat Anhänge im RAM gepuffert → aktualisieren. |
 | Logs ansehen | `docker logs tandem` |

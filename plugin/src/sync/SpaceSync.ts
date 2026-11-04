@@ -14,6 +14,7 @@ import { DiskBridge } from "../disk/DiskBridge";
 import { EditorBinder } from "../editor/EditorBinder";
 import { BlobSync } from "../blobs/BlobSync";
 import type { SpaceKey } from "../crypto/e2ee";
+import type { Transfer } from "../blobs/TransferGuard";
 
 export interface SpaceSyncOptions {
 	app: App;
@@ -26,6 +27,8 @@ export interface SpaceSyncOptions {
 	log?(msg: string): void;
 	/** Ende-zu-Ende-verschlüsselter Space: Schlüssel (sonst null). */
 	key?: SpaceKey | null;
+	/** Eine große Übertragung kam beim letzten Lauf nicht zu Ende (App beendet) und wird nun übersprungen. */
+	onTransferLost?(t: Transfer): void;
 }
 
 /** Standard-Ignorierliste (zusätzlich zu den Einstellungen). */
@@ -99,7 +102,7 @@ export class SpaceSync {
 			readOnly: () => this.role() === "read",
 			exclusive: <T,>(path: string, fn: () => Promise<T>) => (this.inkExclusive ? this.inkExclusive(path, fn) : fn()),
 		});
-		this.blobs = new BlobSync(app, this.index, this.bridge, this.o.store, this.o.space, this.o.http, this.o.key ?? null);
+		this.blobs = new BlobSync(app, this.index, this.bridge, this.o.store, this.o.space, this.o.http, this.o.key ?? null, (t) => this.o.onTransferLost?.(t));
 		this.binder = new EditorBinder({
 			app,
 			docs: this.docs,
@@ -205,6 +208,19 @@ export class SpaceSync {
 				this.pending--;
 				if (this.pending === 0) for (const w of this.idleWaiters.splice(0)) w();
 			});
+	}
+
+	/** Übersprungene Anhänge erneut übertragen (Einstellungen). */
+	async retrySkipped() {
+		for (const t of await this.blobs.guard.clear()) {
+			if (t.dir === "down" && t.hash) {
+				const hash = t.hash;
+				this.track(() => this.blobs.fetch(t.path, hash));
+			} else if (t.dir === "up") {
+				const file = this.o.app.vault.getFileByPath(t.path);
+				if (file) this.track(() => this.blobs.upload(file));
+			}
+		}
 	}
 
 	/** Wartet, bis keine Hintergrundarbeit mehr läuft (Tests, Statusanzeige). */

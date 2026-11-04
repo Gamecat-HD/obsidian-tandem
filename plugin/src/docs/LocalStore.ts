@@ -67,6 +67,17 @@ export class LocalStore {
 		await req(this.store("meta", "readwrite").put(value, key));
 	}
 
+	/** Wie `setMeta`, wartet aber, bis der Wert sicher gespeichert ist – für Werte, die einen Absturz überstehen müssen. */
+	async setMetaDurable(key: string, value: unknown): Promise<void> {
+		if (!this.db) throw new Error("LocalStore nicht geöffnet");
+		const tx = this.db.transaction("meta", "readwrite", { durability: "strict" });
+		tx.objectStore("meta").put(value, key);
+		await new Promise<void>((ok, fail) => {
+			tx.oncomplete = () => ok();
+			tx.onerror = tx.onabort = () => fail(tx.error);
+		});
+	}
+
 	/** Alles löschen (Space wechseln / Neu einrichten). */
 	async clear(): Promise<void> {
 		await req(this.store("docs", "readwrite").clear());

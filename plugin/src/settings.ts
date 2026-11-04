@@ -15,6 +15,11 @@ export interface TandemSettings {
 	backupBeforeFirstSync: boolean;
 }
 
+/** „ (57,7 MB)“; leer, wenn die Größe unbekannt ist. */
+export function formatSize(bytes?: number): string {
+	return bytes === undefined ? "" : ` (${(bytes / 1048576).toFixed(1).replace(".", ",")} MB)`;
+}
+
 export const DEFAULT_SETTINGS: TandemSettings = {
 	enabled: true,
 	serverUrl: "",
@@ -136,7 +141,25 @@ export class TandemSettingTab extends PluginSettingTab {
 
 		this.renderEncryption(containerEl.createDiv());
 		this.renderPeople(containerEl.createDiv());
+		this.renderSkipped(containerEl.createDiv());
 		this.renderUpdate(containerEl.createDiv());
+	}
+
+	/** Anhänge, bei deren Übertragung die App beendet wurde. Erscheint nur, wenn es welche gibt. */
+	private renderSkipped(el: HTMLElement) {
+		const sync = this.plugin.sync;
+		const skipped = sync?.blobs?.guard.list() ?? [];
+		if (!sync || !skipped.length) return;
+		new Setting(el).setName("Übersprungene Anhänge").setHeading();
+		new Setting(el)
+			.setName(skipped.map((t) => `${t.path}${formatSize(t.size)}`).join(", "))
+			.setDesc("Beim Übertragen dieser Dateien wurde die App beendet, zum Beispiel weil der Speicher nicht reichte. Sie werden auf diesem Gerät nicht abgeglichen. Stürzt die App beim erneuten Versuch wieder ab, landen sie wieder hier.")
+			.addButton((b) =>
+				b.setButtonText("Erneut versuchen").onClick(async () => {
+					await sync.retrySkipped();
+					this.display();
+				}),
+			);
 	}
 
 	/** Ende-zu-Ende-Verschlüsselung: Zustand, Einrichten (Besitzer, leerer Vault), Entsperren, Schlüssel vergessen. */

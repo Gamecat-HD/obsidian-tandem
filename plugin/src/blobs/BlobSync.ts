@@ -8,6 +8,7 @@ import type { DiskBridge } from "../disk/DiskBridge";
 import { sha256Hex } from "../disk/diff";
 import type { LocalStore } from "../docs/LocalStore";
 import type { SpaceKey } from "../crypto/e2ee";
+import { TransferGuard, type Transfer } from "./TransferGuard";
 
 export const MAX_BLOB = 100 * 1024 * 1024;
 
@@ -18,6 +19,7 @@ export class BlobSync {
 	pendingUploads = new Set<string>();
 	private loaded: Promise<void>;
 	private saveTimer: number | null = null;
+	readonly guard: TransferGuard;
 
 	constructor(
 		readonly app: App,
@@ -28,8 +30,12 @@ export class BlobSync {
 		readonly http: () => { base: string; token: string },
 		/** Verschlüsselter Space: Anhänge werden vor dem Hochladen verschlüsselt (Adresse = Hash des Chiffretexts). */
 		readonly key: SpaceKey | null = null,
+		/** Eine große Übertragung kam beim letzten Lauf nicht zu Ende (App beendet) und wird nun übersprungen. */
+		onTransferLost?: (t: Transfer) => void,
 	) {
+		this.guard = new TransferGuard(store, space, onTransferLost);
 		this.loaded = Promise.all([
+			this.guard.loaded,
 			store.getMeta<Record<string, string>>(`blobs:${space}`).then((m) => {
 				for (const [p, h] of Object.entries(m ?? {})) this.known.set(p, h);
 			}),
@@ -95,6 +101,12 @@ export class BlobSync {
 			console.warn(`[tandem] ${file.path}: größer als ${MAX_BLOB / 1048576} MiB, wird nicht synchronisiert`);
 			return;
 		}
+		const t: Transfer = { key: `up:${file.path}:${file.stat.mtime}`, path: file.path, dir: "up", size: file.stat.size };
+		if (this.guard.isSkipped(t.key)) return;
+		await this.guard.run(t, () => this.sendFile(file));
+	}
+
+	private async sendFile(file: TFile): Promise<void> {
 		const data = await this.app.vault.readBinary(file);
 		const hash = await sha256Hex(data);
 		const id = this.index.idForPath(file.path);
@@ -105,8 +117,7 @@ export class BlobSync {
 		}
 		const sealed = this.key ? await this.key.sealBlob(new Uint8Array(data), hash) : null;
 		const addr = sealed?.ehash ?? hash;
-		const head = await requestUrl({ url: this.url(addr), method: "HEAD", headers: this.headers(), throw: false });
-		if (head.status === 404) {
+		if (!(await this.onServer(addr))) {
 			const r = await requestUrl({
 				url: this.url(addr),
 				method: "PUT",
@@ -115,11 +126,27 @@ export class BlobSync {
 				throw: false,
 			});
 			if (r.status >= 300) throw new Error(`Upload ${file.path}: HTTP ${r.status}`);
-		} else if (head.status >= 300) throw new Error(`Upload ${file.path}: HTTP ${head.status}`);
+		}
 		const extra = sealed ? { ehash: sealed.ehash } : {};
 		if (id) this.index.update(id, { hash, size: data.byteLength, parent: entry?.hash, ...extra });
 		else this.index.add(file.path, "blob", { hash, size: data.byteLength, ...extra });
 		this.remember(file.path, hash);
+	}
+
+	/**
+	 * Liegt der Inhalt schon auf dem Server? HEAD wirft in der Android-App „IOException Stream closed“. Dann gilt:
+	 * nicht vorhanden. Der Upload schadet nicht, der Server legt Inhalte nach Hash ab und überschreibt sich nur selbst.
+	 */
+	private async onServer(addr: string): Promise<boolean> {
+		let status: number;
+		try {
+			status = (await requestUrl({ url: this.url(addr), method: "HEAD", headers: this.headers(), throw: false })).status;
+		} catch {
+			return false;
+		}
+		if (status === 404) return false;
+		if (status >= 300) throw new Error(`Anhang prüfen: HTTP ${status}`);
+		return true;
 	}
 
 	/**
@@ -139,6 +166,12 @@ export class BlobSync {
 		if (id && entry?.hash !== hash) return;
 		const addr = this.key ? entry?.ehash : hash;
 		if (!addr) throw new Error(`Download ${path}: Adresse des verschlüsselten Anhangs fehlt`);
+		const t: Transfer = { key: `down:${path}:${hash}`, path, dir: "down", hash, size: entry?.size };
+		if (this.guard.isSkipped(t.key)) return;
+		await this.guard.run(t, () => this.receiveFile(path, hash, parent, addr));
+	}
+
+	private async receiveFile(path: string, hash: string, parent: string | undefined, addr: string): Promise<void> {
 		const file = this.app.vault.getFileByPath(path);
 		if (file) {
 			const local = await sha256Hex(await this.app.vault.readBinary(file));
