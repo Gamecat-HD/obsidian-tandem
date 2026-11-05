@@ -5,7 +5,7 @@ import { LocalStore } from "./docs/LocalStore";
 import { collabBaseExtension } from "./editor/collab";
 import { SpaceSync } from "./sync/SpaceSync";
 import { Presence, initials, type Peer } from "./presence/Presence";
-import { DEFAULT_SETTINGS, TandemSettingTab, type TandemSettings } from "./settings";
+import { DEFAULT_SETTINGS, formatSize, TandemSettingTab, type TandemSettings } from "./settings";
 import { InkBridge } from "./ink/InkBridge";
 import { HistoryModal, listSnapshots, loadSnapshot } from "./ui/History";
 import { backupVault, canBackup } from "./ui/Backup";
@@ -285,6 +285,10 @@ export default class TandemPlugin extends Plugin {
 			http: () => this.http(),
 			log: (m) => console.log("[tandem]", m),
 			key: this.key,
+			onTransferLost: (t) => {
+				const name = t.path.split("/").pop();
+				new Notice(`Tandem: Beim Übertragen von „${name}“${formatSize(t.size)} wurde die App beendet. Die Datei wird auf diesem Gerät übersprungen. Erneut versuchen: Einstellungen → Tandem.`, 20000);
+			},
 		});
 		this.sync = sync;
 		sync.docs.onDecryptError = (docId, e) => {
