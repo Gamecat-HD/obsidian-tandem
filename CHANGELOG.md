@@ -1,6 +1,6 @@
 # Änderungen
 
-## Nächste Version
+## 0.6.1
 
 - **Keine Absturzschleife durch große Anhänge:** Auf Android beendete schon ein einzelner Download von über 50 MB die App, und beim nächsten Start ging es von vorn los. Anhänge ab 16 MiB werden jetzt einzeln übertragen. Wird die App dabei beendet, überspringt Tandem diese Fassung der Datei auf dem Gerät und meldet das. Erneut versuchen unter Einstellungen → Tandem. Der Download selbst bleibt dort bei dieser Größe noch unmöglich.
 - **Uploads von Android:** Die Prüfung per HEAD wirft dort „IOException Stream closed“. Tandem lädt in dem Fall direkt hoch.
