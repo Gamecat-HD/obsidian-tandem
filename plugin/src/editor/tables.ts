@@ -8,8 +8,9 @@
  * 1. Senden: yRemoteSelections übernimmt die Auswahl nur, wenn der Haupteditor selbst den Fokus hat.
  *    In einer Zelle liegt der Fokus im eingebetteten Editor → der alte Cursor blieb stehen.
  *    `tableCursorSync` springt genau dann ein.
- * 2. Anzeigen: Dekorationen innerhalb eines ersetzten Bereichs (das Tabellen-Widget) sind unsichtbar.
- *    `tableCarets` zeichnet fremde Cursor deshalb als Ebene über die passende Zelle.
+ * 2. Anzeigen: Dekorationen innerhalb eines ersetzten Bereichs (Tabellen-, Formel-, Callout-Widget …) sind
+ *    unsichtbar. `hiddenCarets` zeichnet fremde Cursor deshalb als Ebene: in Tabellen exakt in der Zelle,
+ *    in anderen Widgets als farbiger Rahmen um den ganzen Block.
  *
  * Die Tabellen-Objekte sind Obsidian-intern und nicht typisiert; sie werden über die
  * Dekorationen gefunden und nur per Duck-Typing benutzt. Fehlt etwas, entfällt nur die Anzeige.
@@ -35,25 +36,6 @@ interface ObsidianTable {
 function isTable(w: unknown): w is ObsidianTable {
 	const t = w as ObsidianTable | null;
 	return !!t && typeof t.start === "number" && typeof t.end === "number" && Array.isArray(t.rows) && t.containerEl instanceof HTMLElement;
-}
-
-/** Sichtbare Tabellen-Widgets des Editors. */
-function tablesIn(view: EditorView): ObsidianTable[] {
-	const out: ObsidianTable[] = [];
-	const { from, to } = view.viewport;
-	for (const src of view.state.facet(EditorView.decorations)) {
-		let set;
-		try {
-			set = typeof src === "function" ? src(view) : src;
-		} catch {
-			continue;
-		}
-		set?.between(from, to, (_f, _t, deco) => {
-			const w = deco.spec.widget;
-			if (isTable(w) && w.containerEl.isConnected && !out.includes(w)) out.push(w);
-		});
-	}
-	return out;
 }
 
 /** Fokus liegt in einem eingebetteten Editor (Tabellenzelle) dieses Editors. */
@@ -213,10 +195,119 @@ class TableCaret implements LayerMarker {
 	}
 }
 
-/** (2) Fremde Cursor in Tabellenzellen anzeigen. */
-export const tableCarets = layer({
+/** Gerendertes Widget (Formel, Callout, Einbettung …), das die Stelle `pos` verdeckt. */
+interface Cover {
+	from: number;
+	to: number;
+	widget: unknown;
+}
+
+function coverAt(view: EditorView, pos: number): Cover | null {
+	let found: Cover | null = null;
+	for (const src of view.state.facet(EditorView.decorations)) {
+		let set;
+		try {
+			set = typeof src === "function" ? src(view) : src;
+		} catch {
+			continue;
+		}
+		set?.between(pos, pos, (from, to, deco) => {
+			const widget = deco.spec.widget;
+			if (!widget || from === to) return;
+			// Block-Widgets verschlucken auch Cursor an ihren Rändern, Inline-Widgets nur am Anfang.
+			const inside = deco.spec.block ? pos >= from && pos <= to : pos >= from && pos < to;
+			if (inside && (!found || to - from > found.to - found.from)) found = { from, to, widget };
+		});
+	}
+	return found;
+}
+
+/** DOM-Element eines Widgets: Obsidians Widgets bringen `containerEl` mit, sonst über die Position suchen. */
+function widgetDom(view: EditorView, cover: Cover): HTMLElement | null {
+	const own = (cover.widget as { containerEl?: unknown }).containerEl;
+	if (own instanceof HTMLElement && own.isConnected && view.contentDOM.contains(own)) return own;
+	for (const el of Array.from(view.contentDOM.querySelectorAll<HTMLElement>('[contenteditable="false"]'))) {
+		if (el.parentElement?.closest('[contenteditable="false"]')) continue;
+		try {
+			if (view.posAtDOM(el) === cover.from) return el;
+		} catch {
+			/* nicht im Dokument */
+		}
+	}
+	return null;
+}
+
+interface Who {
+	color: string;
+	name: string;
+}
+
+/** Rahmen um ein Widget, in dem jemand mit dem Cursor steht; Namen als Schildchen darüber. */
+class WidgetBox implements LayerMarker {
+	constructor(
+		readonly who: Who[],
+		readonly left: number,
+		readonly top: number,
+		readonly width: number,
+		readonly height: number,
+	) {}
+
+	draw() {
+		const el = document.createElement("div");
+		el.className = "tandem-widget-cursor";
+		el.appendChild(document.createElement("div")).className = "tandem-widget-cursor-names";
+		this.adjust(el);
+		return el;
+	}
+
+	update(el: HTMLElement, prev: LayerMarker) {
+		if (!(prev instanceof WidgetBox)) return false;
+		this.adjust(el);
+		return true;
+	}
+
+	private adjust(el: HTMLElement) {
+		const c = this.who[0].color;
+		Object.assign(el.style, {
+			left: `${this.left}px`,
+			top: `${this.top}px`,
+			width: `${this.width}px`,
+			height: `${this.height}px`,
+			borderColor: c,
+			backgroundColor: c + "1f",
+		});
+		const names = el.firstElementChild as HTMLElement;
+		names.replaceChildren(
+			...this.who.map((w) => {
+				const n = document.createElement("span");
+				n.className = "tandem-widget-cursor-name";
+				n.textContent = w.name;
+				n.style.backgroundColor = w.color;
+				return n;
+			}),
+		);
+	}
+
+	eq(o: LayerMarker): boolean {
+		return (
+			o instanceof WidgetBox &&
+			o.left === this.left &&
+			o.top === this.top &&
+			o.width === this.width &&
+			o.height === this.height &&
+			o.who.length === this.who.length &&
+			o.who.every((w, i) => w.name === this.who[i].name && w.color === this.who[i].color)
+		);
+	}
+}
+
+/**
+ * (2) Fremde Cursor in gerenderten Bereichen anzeigen: in Tabellen als Cursor in der Zelle,
+ * in anderen Widgets (Formeln, Callouts, Einbettungen) als farbiger Rahmen um den ganzen Block.
+ */
+export const hiddenCarets = layer({
 	above: true,
-	class: "tandem-table-carets",
+	class: "tandem-hidden-carets",
 	// Jede Transaktion: auch reine Awareness-Meldungen von yRemoteSelections und Zell-Eingaben.
 	update: (u) => u.transactions.length > 0 || u.focusChanged,
 	markers(view) {
@@ -225,8 +316,8 @@ export const tableCarets = layer({
 		const ytext = conf.ytext;
 		const awareness = conf.awareness as Awareness;
 		const ydoc = ytext.doc!;
-		let tables: ObsidianTable[] | null = null;
-		const out: TableCaret[] = [];
+		const out: LayerMarker[] = [];
+		const boxes = new Map<HTMLElement, Who[]>();
 		const rect = view.scrollDOM.getBoundingClientRect();
 		const baseLeft = rect.left - view.scrollDOM.scrollLeft * view.scaleX;
 		const baseTop = rect.top - view.scrollDOM.scrollTop * view.scaleY;
@@ -234,26 +325,54 @@ export const tableCarets = layer({
 			if (id === awareness.clientID || !st?.cursor?.head) return;
 			const head = Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(st.cursor.head), ydoc);
 			if (!head || head.type !== ytext || head.index > view.state.doc.length) return;
-			if (!view.state.doc.lineAt(head.index).text.includes("|")) return; // keine Tabellenzeile
-			tables ??= tablesIn(view);
-			const table = tables.find((t) => head.index > t.start && head.index <= t.end);
-			if (!table) return;
-			const c = caretCoords(view, table, head.index);
-			if (!c) return;
+			const cover = coverAt(view, head.index);
+			if (!cover) return;
 			const { color = "#30bced", name = "Anonymous" } = st.user ?? {};
-			out.push(new TableCaret(color, name, (c.left - baseLeft) / view.scaleX, (c.top - baseTop) / view.scaleY, c.height / view.scaleY));
+			if (isTable(cover.widget)) {
+				const c = caretCoords(view, cover.widget, head.index);
+				if (c) out.push(new TableCaret(color, name, (c.left - baseLeft) / view.scaleX, (c.top - baseTop) / view.scaleY, c.height / view.scaleY));
+				return;
+			}
+			const el = widgetDom(view, cover);
+			if (!el) return;
+			const list = boxes.get(el) ?? [];
+			list.push({ color, name });
+			boxes.set(el, list);
 		});
+		for (const [el, who] of boxes) {
+			const r = el.getBoundingClientRect();
+			if (!r.width && !r.height) continue;
+			who.sort((x, y) => x.name.localeCompare(y.name));
+			out.push(new WidgetBox(who, (r.left - baseLeft) / view.scaleX, (r.top - baseTop) / view.scaleY, r.width / view.scaleX, r.height / view.scaleY));
+		}
 		return out;
 	},
 });
 
-export const tableCaretsTheme = EditorView.baseTheme({
-	".tandem-table-carets": { pointerEvents: "none" },
-	".tandem-table-carets .tandem-table-caret": {
+export const hiddenCaretsTheme = EditorView.baseTheme({
+	".tandem-hidden-carets": { pointerEvents: "none" },
+	".tandem-hidden-carets .tandem-table-caret": {
 		position: "absolute",
 		width: "2px",
 		marginLeft: "-1px",
 		display: "block",
 		pointerEvents: "auto",
 	},
+	".tandem-hidden-carets .tandem-widget-cursor": {
+		position: "absolute",
+		boxSizing: "border-box",
+		border: "2px solid",
+		borderRadius: "4px",
+	},
+	".tandem-widget-cursor-names": {
+		position: "absolute",
+		top: "-1.35em",
+		left: "-2px",
+		display: "flex",
+		gap: "2px",
+		fontSize: ".75em",
+		lineHeight: "normal",
+		whiteSpace: "nowrap",
+	},
+	".tandem-widget-cursor-name": { color: "white", padding: "0 3px", borderRadius: "3px 3px 0 0" },
 });

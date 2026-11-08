@@ -1,5 +1,11 @@
 # Änderungen
 
+## 0.6.3
+
+Nur das Plugin hat sich geändert.
+
+- **Cursor in Formeln und anderen gerenderten Blöcken:** Steht jemand mit dem Cursor in einer Formel (`$$ … $$` oder `$…$`), die bei dir gerendert ist, war der Cursor bisher unsichtbar. Jetzt wird die Formel in der Farbe der Person umrahmt, ihr Name steht darüber. Dasselbe gilt für alle anderen gerenderten Bereiche, etwa Callouts und Einbettungen. In Tabellen bleibt es beim genauen Cursor in der Zelle. Test `m18`.
+
 ## 0.6.2
 
 Nur das Plugin hat sich geändert; der Server muss nicht neu ausgerollt werden.

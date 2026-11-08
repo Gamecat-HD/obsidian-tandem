@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-tandem",
-	"version": "0.6.2",
+	"version": "0.6.3",
 	"private": true,
 	"description": "Obsidian-Plugin: Echtzeit-Zusammenarbeit und Vault-Sync (Yjs)",
 	"main": "main.js",

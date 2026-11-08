@@ -17,7 +17,7 @@ import { yRemoteSelections, yRemoteSelectionsTheme, ySyncAnnotation, ySyncFacet,
 import type * as Y from "yjs";
 import type { Awareness } from "y-protocols/awareness";
 import { minimalReplace, textChanges } from "../disk/diff";
-import { forObsidianTables, tableCarets, tableCaretsTheme, tableCursorSync } from "./tables";
+import { forObsidianTables, hiddenCarets, hiddenCaretsTheme, tableCursorSync } from "./tables";
 
 export const collabCompartment = new Compartment();
 
@@ -112,10 +112,10 @@ export function bindEditor(view: EditorView, path: string, ytext: Y.Text, awaren
 			syncPlugin(path),
 			yRemoteSelectionsTheme,
 			yRemoteSelections,
-			// Tabellen: Zell-Editor sendet Cursor, fremde Cursor über der Zelle zeichnen.
+			// Tabellen: Zell-Editor sendet Cursor. Fremde Cursor in gerenderten Bereichen (Tabelle, Formel …) zeichnen.
 			tableCursorSync,
-			tableCarets,
-			tableCaretsTheme,
+			hiddenCarets,
+			hiddenCaretsTheme,
 			// Nur-Lese-Mitglieder sehen live mit, können aber nicht tippen.
 			readOnly ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : [],
 		]),
