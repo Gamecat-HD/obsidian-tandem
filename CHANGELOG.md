@@ -1,5 +1,13 @@
 # Änderungen
 
+## 0.6.2
+
+Nur das Plugin hat sich geändert; der Server muss nicht neu ausgerollt werden.
+
+- **Cursor in Tabellen:** Wer in der Live-Vorschau in einer Tabellenzelle tippt oder sich darin bewegt, wird bei den anderen jetzt an dieser Stelle angezeigt. Bisher blieb der Cursor an der letzten Position außerhalb der Tabelle stehen, weil Obsidian Zellen in einem eigenen Editor bearbeitet. Fremde Cursor erscheinen jetzt auch in der Zelle selbst. Vorher waren sie im Tabellen-Widget unsichtbar.
+- **Gleichzeitig in einer Tabelle schreiben:** Beim Betreten einer Zelle schreibt Obsidian die ganze Tabelle neu. Tandem hat das bisher als „alles löschen und neu einfügen“ verschickt. Dadurch sprangen die Cursor anderer, und ihre gleichzeitigen Eingaben in der Tabelle konnten verloren gehen. Jetzt geht nur der echte Unterschied raus. Fremde Änderungen an der Trennzeile kommen so an, dass Obsidian den offenen Zell-Editor nicht mehr zerstört.
+- API: `cursors(path)` liefert die Cursor der anderen als absolute Positionen. Test `m17`.
+
 ## 0.6.1
 
 - **Keine Absturzschleife durch große Anhänge:** Auf Android beendete schon ein einzelner Download von über 50 MB die App, und beim nächsten Start ging es von vorn los. Anhänge ab 16 MiB werden jetzt einzeln übertragen. Wird die App dabei beendet, überspringt Tandem diese Fassung der Datei auf dem Gerät und meldet das. Erneut versuchen unter Einstellungen → Tandem. Der Download selbst bleibt dort bei dieser Größe noch unmöglich.

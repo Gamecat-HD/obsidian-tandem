@@ -40,6 +40,31 @@ export function textChanges(from: string, to: string): { from: number; to: numbe
 	return out;
 }
 
+/**
+ * Ersetzung `old` → `neu` als Folge kleiner Schritte (Positionen relativ zum Anfang, nacheinander anzuwenden),
+ * wenn beide Texte überwiegend gleich sind. Sonst `null` (dann bleibt es beim einfachen Ersetzen,
+ * z. B. beim Überschreiben einer Markierung mit ganz anderem Text).
+ */
+export function minimalReplace(old: string, neu: string): { from: number; to: number; insert: string }[] | null {
+	if (old === neu) return [];
+	if (old.length + neu.length > 1_000_000) return null; // Diff zu teuer; einfach ersetzen
+	const parts = diff(old, neu);
+	let same = 0;
+	for (const [op, s] of parts) if (op === diff.EQUAL) same += s.length;
+	if (same * 2 < Math.max(old.length, neu.length)) return null;
+	const out: { from: number; to: number; insert: string }[] = [];
+	let pos = 0;
+	for (const [op, s] of parts) {
+		if (op === diff.EQUAL) pos += s.length;
+		else if (op === diff.DELETE) out.push({ from: pos, to: pos + s.length, insert: "" });
+		else {
+			out.push({ from: pos, to: pos, insert: s });
+			pos += s.length;
+		}
+	}
+	return out;
+}
+
 export async function sha256Hex(data: ArrayBuffer | Uint8Array | string): Promise<string> {
 	const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data instanceof Uint8Array ? data : new Uint8Array(data);
 	const h = await crypto.subtle.digest("SHA-256", bytes as BufferSource);

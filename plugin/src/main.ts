@@ -77,6 +77,7 @@ export default class TandemPlugin extends Plugin {
 		// Öffentliche Schnittstelle (Tests, andere Plugins wie Ink Blocks).
 		this.api = {
 			peers: () => this.presence?.peers ?? [],
+			cursors: (path: string) => this.cursorsIn(path),
 			status: () => this.conn?.status ?? "offline",
 			history: (docId: string) => listSnapshots(this.http(), this.settings.space, docId),
 			snapshotText: async (docId: string, ts: number) => (await loadSnapshot(this.http(), this.settings.space, docId, ts, this.key)).getText("content").toString(),
@@ -581,6 +582,22 @@ export default class TandemPlugin extends Plugin {
 			await ws.getLeaf(false).openFile(f);
 		}
 		window.setTimeout(() => this.scrollToCursor(peer), 300);
+	}
+
+	/** Cursor der anderen in einer gekoppelten Notiz, als absolute Positionen. */
+	private cursorsIn(path: string): { name: string; anchor: number; head: number }[] {
+		const session = this.sync?.binder.sessionFor(path);
+		const aw = session?.awareness;
+		if (!session || !aw) return [];
+		const abs = (rel: unknown) => Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(rel), session.doc)?.index;
+		const out: { name: string; anchor: number; head: number }[] = [];
+		for (const [id, st] of aw.getStates()) {
+			if (id === aw.clientID || !st?.cursor?.head) continue;
+			const head = abs(st.cursor.head);
+			const anchor = abs(st.cursor.anchor);
+			if (head !== undefined && anchor !== undefined) out.push({ name: st.user?.name ?? "", anchor, head });
+		}
+		return out;
 	}
 
 	private scrollToCursor(peer: Peer) {

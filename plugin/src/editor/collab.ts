@@ -16,7 +16,8 @@ import { editorInfoField } from "obsidian";
 import { yRemoteSelections, yRemoteSelectionsTheme, ySyncAnnotation, ySyncFacet, YSyncConfig } from "y-codemirror.next";
 import type * as Y from "yjs";
 import type { Awareness } from "y-protocols/awareness";
-import { textChanges } from "../disk/diff";
+import { minimalReplace, textChanges } from "../disk/diff";
+import { forObsidianTables, tableCarets, tableCaretsTheme, tableCursorSync } from "./tables";
 
 export const collabCompartment = new Compartment();
 
@@ -54,7 +55,7 @@ function syncPlugin(path: string) {
 							pos += d.delete;
 						} else pos += d.retain ?? 0;
 					}
-					this.view.dispatch({ changes, annotations: [ySyncAnnotation.of(this.conf)] });
+					this.view.dispatch({ ...forObsidianTables(this.view, changes), annotations: [ySyncAnnotation.of(this.conf)] });
 				};
 				this.ytext.observe(this.observer);
 			}
@@ -64,13 +65,26 @@ function syncPlugin(path: string) {
 				// Wächter: Editor zeigt inzwischen eine andere Datei → nichts übernehmen.
 				if (filePathOf(update.state) !== path || filePathOf(update.startState) !== path) return;
 				const ytext = this.ytext;
+				const old = update.startState.doc;
 				ytext.doc!.transact(() => {
 					let adj = 0;
 					update.changes.iterChanges((fromA, toA, _fromB, _toB, insert) => {
 						const text = insert.sliceString(0, insert.length, "\n");
-						if (fromA !== toA) ytext.delete(fromA + adj, toA - fromA);
-						if (text.length > 0) ytext.insert(fromA + adj, text);
+						const at = fromA + adj;
 						adj += text.length - (toA - fromA);
+						// Ersetzungen auf den echten Unterschied verkleinern: Obsidians Tabellen-Editor schreibt beim
+						// Betreten einer Zelle die ganze Tabelle neu (oft unverändert). Als Löschen + Einfügen würde das
+						// gleichzeitige Eingaben anderer in der Tabelle verwerfen und ihre Cursor verschieben.
+						const parts = fromA !== toA && text.length > 0 ? minimalReplace(old.sliceString(fromA, toA, "\n"), text) : null;
+						if (parts) {
+							for (const p of parts) {
+								if (p.from !== p.to) ytext.delete(at + p.from, p.to - p.from);
+								if (p.insert) ytext.insert(at + p.from, p.insert);
+							}
+							return;
+						}
+						if (fromA !== toA) ytext.delete(at, toA - fromA);
+						if (text.length > 0) ytext.insert(at, text);
 					});
 				}, this.conf);
 			}
@@ -98,6 +112,10 @@ export function bindEditor(view: EditorView, path: string, ytext: Y.Text, awaren
 			syncPlugin(path),
 			yRemoteSelectionsTheme,
 			yRemoteSelections,
+			// Tabellen: Zell-Editor sendet Cursor, fremde Cursor über der Zelle zeichnen.
+			tableCursorSync,
+			tableCarets,
+			tableCaretsTheme,
 			// Nur-Lese-Mitglieder sehen live mit, können aber nicht tippen.
 			readOnly ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : [],
 		]),
