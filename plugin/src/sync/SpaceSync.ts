@@ -10,7 +10,8 @@ import { REMOTE, type DocSession } from "../docs/DocSession";
 import type { LocalStore } from "../docs/LocalStore";
 import { kindForPath, newDocId, VaultIndex, type IndexEntry } from "../docs/VaultIndex";
 import { sha256Hex } from "../disk/diff";
-import { DiskBridge } from "../disk/DiskBridge";
+import { DiskBridge, LOCAL as FROM_DISK } from "../disk/DiskBridge";
+import { Source, type Author } from "../blame/authorship";
 import { EditorBinder } from "../editor/EditorBinder";
 import { BlobSync } from "../blobs/BlobSync";
 import type { SpaceKey } from "../crypto/e2ee";
@@ -44,6 +45,8 @@ export interface SpaceSyncOptions {
 	 * erkennt). `restore` holt alle zurück, auf allen Geräten; fehlt bei Nur-Lese-Zugriff.
 	 */
 	onReferencedDelete?(items: ReferencedDelete[], restore: (() => number) | null): void;
+	/** Wer gerade schreibt (Blame); null = noch unbekannt. Fehlt: keine Autorenschaft erfassen. */
+	author?(): Author | null;
 	/** Partner-Plugin (Live-API): lokaler Stand einer Datei steckt im Begleit-Dokument → keine Konfliktkopie. */
 	represented?(path: string, hash: string): boolean;
 }
@@ -124,6 +127,8 @@ export class SpaceSync {
 
 	constructor(readonly o: SpaceSyncOptions) {
 		this.docs = new DocManager(o.conn, o.store, o.space, o.key ?? null);
+		const author = o.author;
+		if (author) this.docs.authorship = { who: () => author(), sourceOf: (origin) => (origin === FROM_DISK ? Source.File : Source.Editor) };
 	}
 
 	private log(msg: string) {

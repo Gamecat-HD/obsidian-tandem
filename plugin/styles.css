@@ -45,3 +45,31 @@
 .tandem-invite-result { margin: 8px 0 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .tandem-invite-result:empty { display: none; }
 .tandem-code { font-size: 1.2em; font-weight: 700; letter-spacing: 0.05em; padding: 2px 8px; user-select: all; }
+
+/* ── Blame-Spalte (wer hat welche Zeile zuletzt geändert) ─────────────── */
+.cm-gutter.tandem-blame .tandem-blame-line {
+	width: 9em;
+	box-sizing: border-box;
+	padding: 0 6px 0 7px;
+	border-left: 3px solid var(--tandem-blame-color, transparent);
+	color: var(--text-faint);
+	font-size: var(--font-ui-smaller);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	text-align: left;
+	cursor: default;
+}
+.cm-gutter.tandem-blame .tandem-blame-line.is-first {
+	color: var(--text-muted);
+}
+.cm-gutter.tandem-blame .tandem-blame-line.is-unknown {
+	border-left: 3px dotted var(--background-modifier-border);
+}
+.cm-gutter.tandem-blame .tandem-blame-spacer {
+	border-left-color: transparent;
+	visibility: hidden;
+}
+.is-mobile .cm-gutter.tandem-blame .tandem-blame-line {
+	width: 6.5em;
+}
