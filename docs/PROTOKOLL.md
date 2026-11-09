@@ -7,7 +7,7 @@ Jeder Frame beginnt mit `varUint type`.
 
 | type | Name | Richtung | Felder |
 |---|---|---|---|
-| 0 | HELLO | C→S | `varUint version (=1)`, `varString token`, `varString device` |
+| 0 | HELLO | C→S | `varUint version (=1)`, `varString token`, `varString device`, optional `varString client` (ab 0.8.2: `tandem-plugin/<version>` oder eigene Kennung wie `lernplattform`) |
 | 1 | WELCOME | S→C | `varString json` → `{user:{id,name,color}, spaces:[{id,name,role,e2ee?}]}` (`e2ee`: fehlt = Klartext, `"pending"` oder Schlüsselparameter, siehe [E2EE.md](E2EE.md)) |
 | 2 | SYNC | ↔ | `varString doc`, danach eine y-protocols-Sync-Nachricht (`varUint sub` 0=Step1 `varBytes sv` / 1=Step2 `varBytes update` / 2=Update `varBytes update`) |
 | 3 | AWARENESS | ↔ | `varString doc`, `varBytes awarenessUpdate` (y-protocols/awareness-Format) |
@@ -23,7 +23,8 @@ Jeder Frame beginnt mit `varUint type`.
 
 ## Ablauf
 
-1. Client → `HELLO`. Server → `WELCOME` oder `ERROR(401)` und schließt die Verbindung. Vor `HELLO` werden alle anderen Frames verworfen.
+1. Client → `HELLO`. Server → `WELCOME` oder `ERROR(401)` bzw. `ERROR(505)` und schließt die Verbindung. Vor `HELLO` werden alle anderen Frames verworfen.
+   **Plugin-Version:** Der Server bedient nur das Plugin mit genau seiner eigenen Version (`client` = `tandem-plugin/<Server-Version>`). Fehlt `client` (Plugin vor 0.8.2) oder passt die Version nicht, antwortet er vor der Token-Prüfung mit `ERROR(505)`; die Meldung beginnt mit `Tandem-Server <version>`. Andere Clients (z. B. die Lernplattform) senden eine eigene Kennung ohne `tandem-plugin/` und sind nicht an die Plugin-Version gebunden.
 2. **Abonnieren** = `SYNC Step1` mit dem lokalen State-Vector. Der Server lädt das Doc (falls nötig), antwortet mit `SYNC Step2` (fehlende Updates), schickt danach seinen eigenen `SYNC Step1` und die bekannten Awareness-Zustände. Der Client antwortet mit `SYNC Step2`.
 3. Danach fließen `SYNC Update` und `AWARENESS` in beide Richtungen. Der Server verteilt sie an alle anderen Abonnenten dieses Docs.
 4. `UNSUB` beendet das Abo. Der Server entfernt die Awareness-Einträge dieser Verbindung und schickt den anderen eine Löschung. 30 s nach dem letzten Abo wird das Doc aus dem RAM entladen.
@@ -40,11 +41,14 @@ Jeder Frame beginnt mit `varUint type`.
 | 403 | kein Zugriff auf den Space bzw. nur Lesezugriff (Update abgelehnt) |
 | 413 | Nachricht zu groß (Standard: 8 MiB) |
 | 426 | Space ist Ende-zu-Ende-verschlüsselt – Plugin zu alt (SYNC statt ESUB/EUPD) |
+| 505 | Plugin-Version passt nicht zur Server-Version (nur auf HELLO, `doc` leer). Das Plugin verbindet sich danach nicht neu |
 | 500 | Serverfehler |
 
 ## HTTP
 
 Authentifizierung: `Authorization: Bearer <token>`.
+
+Die Routen des Plugins (`/api/invite`, `/api/members`, `/api/e2ee`, `/api/blob`, `/api/history`) verlangen zusätzlich `X-Tandem-Client: tandem-plugin/<Server-Version>`, sonst 426 (vor der Token-Prüfung). `/health`, `/api/redeem`, `/api/status` und die Lese-API (`/api/files`, `/api/file`) brauchen die Kennung nicht.
 
 | Methode | Pfad | Zweck |
 |---|---|---|

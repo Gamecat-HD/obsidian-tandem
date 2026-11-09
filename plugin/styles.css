@@ -3,7 +3,7 @@
 .tandem-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
 .tandem-dot.tandem-online { background: var(--color-green); }
 .tandem-dot.tandem-connecting { background: var(--color-yellow); }
-.tandem-dot.tandem-unauthorized { background: var(--color-red); }
+.tandem-dot.tandem-unauthorized, .tandem-dot.tandem-outdated { background: var(--color-red); }
 .tandem-status-peers { display: inline-flex; margin-left: 4px; }
 .tandem-avatar {
 	display: inline-flex; align-items: center; justify-content: center;

@@ -11,6 +11,8 @@ const encoding = require("lib0/encoding");
 const decoding = require("lib0/decoding");
 const awarenessProto = require("y-protocols/awareness");
 const WebSocket = require("ws");
+// Wie das Plugin melden: Der Server bedient nur das Plugin mit seiner eigenen Version.
+const CLIENT = `tandem-plugin/${require("./manifest.json").version}`;
 
 const [N = 20, D = 50, SECS = 30] = process.argv.slice(2).map(Number);
 const REMOTE = Symbol("remote");
@@ -29,7 +31,7 @@ class Client {
 		this.ws.binaryType = "arraybuffer";
 		this.ready = new Promise((ok, fail) => {
 			this.ws.on("open", () =>
-				this.ws.send(frame((e) => (encoding.writeVarUint(e, 0), encoding.writeVarUint(e, 1), encoding.writeVarString(e, token), encoding.writeVarString(e, "load")))),
+				this.ws.send(frame((e) => (encoding.writeVarUint(e, 0), encoding.writeVarUint(e, 1), encoding.writeVarString(e, token), encoding.writeVarString(e, "load"), encoding.writeVarString(e, CLIENT)))),
 			);
 			this.ws.on("error", fail);
 			this.ws.on("message", (raw) => {

@@ -15,20 +15,20 @@ export interface Snapshot {
 	size: number;
 }
 
-export async function listSnapshots(http: { base: string; token: string }, space: string, docId: string): Promise<Snapshot[]> {
+export async function listSnapshots(http: { base: string; token: string; headers: Record<string, string> }, space: string, docId: string): Promise<Snapshot[]> {
 	const r = await requestUrl({
 		url: `${http.base}/api/history/${encodeURIComponent(space)}/${encodeURIComponent(docId)}`,
-		headers: { Authorization: `Bearer ${http.token}` },
+		headers: http.headers,
 		throw: false,
 	});
 	if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
 	return r.json as Snapshot[];
 }
 
-export async function loadSnapshot(http: { base: string; token: string }, space: string, docId: string, ts: number, key?: SpaceKey | null): Promise<Y.Doc> {
+export async function loadSnapshot(http: { base: string; token: string; headers: Record<string, string> }, space: string, docId: string, ts: number, key?: SpaceKey | null): Promise<Y.Doc> {
 	const r = await requestUrl({
 		url: `${http.base}/api/history/${encodeURIComponent(space)}/${encodeURIComponent(docId)}/${ts}`,
-		headers: { Authorization: `Bearer ${http.token}` },
+		headers: http.headers,
 		throw: false,
 	});
 	if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
@@ -70,7 +70,7 @@ export class HistoryModal extends Modal {
 	constructor(
 		app: App,
 		readonly sync: SpaceSync,
-		readonly http: { base: string; token: string },
+		readonly http: { base: string; token: string; headers: Record<string, string> },
 		readonly space: string,
 		readonly docId: string,
 		readonly path: string,

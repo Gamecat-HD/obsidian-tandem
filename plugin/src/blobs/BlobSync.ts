@@ -38,7 +38,7 @@ export class BlobSync {
 		readonly bridge: DiskBridge,
 		readonly store: LocalStore,
 		readonly space: string,
-		readonly http: () => { base: string; token: string },
+		readonly http: () => { base: string; token: string; headers: Record<string, string> },
 		/** Verschlüsselter Space: Anhänge werden vor dem Hochladen verschlüsselt (Adresse = Hash des Chiffretexts). */
 		readonly key: SpaceKey | null = null,
 		/** Eine große Übertragung kam beim letzten Lauf nicht zu Ende (App beendet) und wird nun übersprungen. */
@@ -65,7 +65,7 @@ export class BlobSync {
 	}
 
 	private headers() {
-		return { Authorization: `Bearer ${this.http().token}` };
+		return this.http().headers;
 	}
 
 	private remember(path: string, hash: string | null) {

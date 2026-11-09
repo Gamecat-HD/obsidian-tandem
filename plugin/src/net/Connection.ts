@@ -6,7 +6,11 @@
  */
 import { decodeFrame, encodeFrame, Msg, PROTOCOL_VERSION, type Frame, type WelcomeInfo } from "./protocol";
 
-export type ConnStatus = "offline" | "connecting" | "online" | "unauthorized";
+/** `outdated`: Server lehnt diese Plugin-Version ab (muss genau zur Server-Version passen). */
+export type ConnStatus = "offline" | "connecting" | "online" | "unauthorized" | "outdated";
+
+/** ERROR-Code des Servers, wenn die Plugin-Version nicht zu ihm passt. */
+export const ERR_VERSION = 505;
 
 export interface DocHandler {
 	onSync(sub: number, data: Uint8Array): void;
@@ -22,6 +26,8 @@ export interface ConnectionOptions {
 	url: string;
 	token: string;
 	device: string;
+	/** Kennung im HELLO, z. B. `tandem-plugin/0.6.4`. */
+	client?: string;
 	/** Nur für Tests: eigene WebSocket-Implementierung. */
 	WebSocketImpl?: typeof WebSocket;
 	pingInterval?: number;
@@ -118,7 +124,7 @@ export class Connection {
 		ws.binaryType = "arraybuffer";
 		this.ws = ws;
 		ws.onopen = () => {
-			ws.send(encodeFrame({ type: Msg.Hello, version: PROTOCOL_VERSION, token: this.opts.token, device: this.opts.device }) as Uint8Array<ArrayBuffer>);
+			ws.send(encodeFrame({ type: Msg.Hello, version: PROTOCOL_VERSION, token: this.opts.token, device: this.opts.device, client: this.opts.client }) as Uint8Array<ArrayBuffer>);
 		};
 		ws.onmessage = (ev) => {
 			if (!(ev.data instanceof ArrayBuffer)) return;
@@ -135,7 +141,7 @@ export class Connection {
 			if (this.ws !== ws) return;
 			this.ws = null;
 			this.clearTimers();
-			if (this.status === "unauthorized" || this.stopped) return;
+			if (this.status === "unauthorized" || this.status === "outdated" || this.stopped) return;
 			this.setStatus("offline");
 			this.scheduleReconnect();
 		};
@@ -175,8 +181,8 @@ export class Connection {
 				this.pongTimer = null;
 				break;
 			case Msg.Error:
-				if (f.code === 401) {
-					this.setStatus("unauthorized");
+				if (f.code === 401 || (f.code === ERR_VERSION && !f.doc)) {
+					this.setStatus(f.code === 401 ? "unauthorized" : "outdated");
 					this.stopped = true;
 					this.ws?.close();
 				}

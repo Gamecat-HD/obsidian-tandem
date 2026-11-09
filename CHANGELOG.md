@@ -1,5 +1,13 @@
 # Änderungen
 
+## 0.8.2
+
+**Server und Plugin müssen jetzt dieselbe Version haben.** Plugin und Server immer zusammen aktualisieren.
+
+- **Server bedient nur das passende Plugin:** Das Plugin meldet beim Verbinden seine Version (`tandem-plugin/<version>` im HELLO, Header `X-Tandem-Client` bei HTTP). Der Server lehnt jedes Plugin ab, dessen Version nicht genau seiner eigenen entspricht. Das betrifft auch alle Plugins vor 0.8.2, die noch keine Version senden. Andere Clients wie die Lernplattform melden sich mit eigener Kennung und sind davon nicht betroffen. Die Lese-API braucht keine Kennung.
+- **Plugin:** Lehnt der Server die Version ab, zeigt die Statusleiste „Plugin-Version passt nicht“, ein Hinweis nennt die Server-Version, und Tandem verbindet sich nicht ständig neu. Unter Einstellungen → Tandem → Version steht dann „Auf <Server-Version> aktualisieren“. Das gilt auch, wenn der Server älter ist als das Plugin. Plugins vor 0.8.2 zeigen nur „offline“ und versuchen es alle 30 s erneut. Sie lassen sich über „Nach Updates suchen“ aktualisieren.
+- Protokoll: optionales Feld `client` am Ende von HELLO, Fehlercode 505. Test `m19`.
+
 ## 0.8.1
 
 Nur das Plugin hat sich geändert; der Server muss nicht neu ausgerollt werden.

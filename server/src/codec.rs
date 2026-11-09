@@ -29,6 +29,10 @@ impl<'a> Reader<'a> {
             shift += 7;
         }
     }
+    /// Alles gelesen? (Für optionale Felder am Frame-Ende.)
+    pub fn done(&self) -> bool {
+        self.pos >= self.buf.len()
+    }
     pub fn bytes(&mut self) -> Result<&'a [u8], DecodeError> {
         let len = self.var_uint()? as usize;
         let end = self.pos.checked_add(len).ok_or(DecodeError)?;
@@ -94,7 +98,9 @@ pub const UPDATE: u64 = 2;
 
 #[derive(Debug, PartialEq)]
 pub enum Frame<'a> {
-    Hello { version: u64, token: &'a str, device: &'a str },
+    /// `client`: optionales Feld am Ende (ab 0.8.2), z. B. `tandem-plugin/0.6.4` oder `lernplattform`.
+    /// Ältere Clients senden es nicht.
+    Hello { version: u64, token: &'a str, device: &'a str, client: Option<&'a str> },
     Sync { doc: &'a str, sub: u64, data: &'a [u8] },
     Awareness { doc: &'a str, data: &'a [u8] },
     Unsub { doc: &'a str },
@@ -112,7 +118,12 @@ pub enum Frame<'a> {
 pub fn decode_client(buf: &[u8]) -> Result<Frame<'_>, DecodeError> {
     let mut r = Reader::new(buf);
     let f = match r.var_uint()? {
-        HELLO => Frame::Hello { version: r.var_uint()?, token: r.string()?, device: r.string()? },
+        HELLO => Frame::Hello {
+            version: r.var_uint()?,
+            token: r.string()?,
+            device: r.string()?,
+            client: if r.done() { None } else { Some(r.string()?) },
+        },
         SYNC => {
             let doc = r.string()?;
             let sub = r.var_uint()?;
@@ -229,7 +240,7 @@ mod tests {
     #[test]
     fn frames() {
         let hello = Writer::new().var_uint(HELLO).var_uint(1).string("tok").string("Laptop").finish();
-        assert_eq!(decode_client(&hello).unwrap(), Frame::Hello { version: 1, token: "tok", device: "Laptop" });
+        assert_eq!(decode_client(&hello).unwrap(), Frame::Hello { version: 1, token: "tok", device: "Laptop", client: None });
         let s = sync("a/b", STEP1, &[0]);
         assert_eq!(decode_client(&s).unwrap(), Frame::Sync { doc: "a/b", sub: STEP1, data: &[0] });
         assert!(decode_client(&[99]).is_err());
@@ -248,7 +259,11 @@ mod tests {
         let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../protocol/vectors.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let get = |k: &str| hex::decode(v[k].as_str().unwrap()).unwrap();
-        assert_eq!(decode_client(&get("hello")).unwrap(), Frame::Hello { version: 1, token: "abc123", device: "iPad Pro ✏️" });
+        assert_eq!(decode_client(&get("hello")).unwrap(), Frame::Hello { version: 1, token: "abc123", device: "iPad Pro ✏️", client: None });
+        assert_eq!(
+            decode_client(&get("hello-client")).unwrap(),
+            Frame::Hello { version: 1, token: "abc123", device: "iPad Pro ✏️", client: Some("tandem-plugin/0.6.4") }
+        );
         assert_eq!(decode_client(&get("sync-step1")).unwrap(), Frame::Sync { doc: "space/_index", sub: STEP1, data: &[0] });
         let upd: Vec<u8> = (0..300).map(|i| (i % 256) as u8).collect();
         assert_eq!(decode_client(&get("sync-update")).unwrap(), Frame::Sync { doc: "space/abc", sub: UPDATE, data: &upd });

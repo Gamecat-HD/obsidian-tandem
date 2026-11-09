@@ -56,7 +56,8 @@ export interface WelcomeInfo {
 }
 
 export type Frame =
-	| { type: Msg.Hello; version: number; token: string; device: string }
+	/** `client`: Kennung am Frame-Ende (ab 0.8.2), z. B. `tandem-plugin/0.6.4`; ältere Clients lassen sie weg. */
+	| { type: Msg.Hello; version: number; token: string; device: string; client?: string }
 	| { type: Msg.Welcome; info: WelcomeInfo }
 	| { type: Msg.Sync; doc: string; sub: SyncSub; data: Uint8Array }
 	| { type: Msg.Awareness; doc: string; data: Uint8Array }
@@ -80,6 +81,7 @@ export function encodeFrame(f: Frame): Uint8Array {
 			encoding.writeVarUint(e, f.version);
 			encoding.writeVarString(e, f.token);
 			encoding.writeVarString(e, f.device);
+			if (f.client !== undefined) encoding.writeVarString(e, f.client);
 			break;
 		case Msg.Welcome:
 			encoding.writeVarString(e, JSON.stringify(f.info));
@@ -153,8 +155,12 @@ export function decodeFrame(buf: Uint8Array): Frame {
 		const d = decoding.createDecoder(buf);
 		const type = decoding.readVarUint(d);
 		switch (type) {
-			case Msg.Hello:
-				return { type, version: decoding.readVarUint(d), token: decoding.readVarString(d), device: decoding.readVarString(d) };
+			case Msg.Hello: {
+				const version = decoding.readVarUint(d);
+				const token = decoding.readVarString(d);
+				const device = decoding.readVarString(d);
+				return decoding.hasContent(d) ? { type, version, token, device, client: decoding.readVarString(d) } : { type, version, token, device };
+			}
 			case Msg.Welcome:
 				return { type, info: JSON.parse(decoding.readVarString(d)) as WelcomeInfo };
 			case Msg.Sync: {

@@ -1,8 +1,12 @@
 // Gemeinsame Helfer für Tandem-E2E-Tests.
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { launch } from "./harness.mjs";
+
+/** Kennung des Plugins; die Plugin-Routen des Servers verlangen sie mit passender Version (Header `X-Tandem-Client`). */
+export const CLIENT = `tandem-plugin/${JSON.parse(readFileSync(resolve(import.meta.dirname, "../plugin/manifest.json"), "utf8")).version}`;
 
 export const ROOT = resolve(import.meta.dirname, "..");
 export { sleep };

@@ -39,22 +39,65 @@ impl App {
 
 pub fn router(app: App) -> Router {
     let admin = if crate::admin::enabled() { crate::admin::router() } else { Router::new() };
-    Router::new()
-        .merge(admin)
-        .route("/health", get(|| async { "ok" }))
-        .route("/ws", get(ws_handler))
-        .route("/api/redeem", post(redeem))
-        .route("/api/status", get(status))
+    // Nur das Obsidian-Plugin ruft diese Routen auf → Plugin-Version muss zum Server passen.
+    let plugin_only = Router::new()
         .route("/api/invite", post(invite))
         .route("/api/members/{space}", get(members))
         .route("/api/e2ee/{space}", post(e2ee_setup))
         .route("/api/blob/{space}/{hash}", get(blob_get).head(blob_head).put(blob_put))
         .route("/api/history/{space}/{doc}", get(history_list))
         .route("/api/history/{space}/{doc}/{ts}", get(history_get))
+        .route_layer(axum::middleware::from_fn(require_plugin_header));
+    Router::new()
+        .merge(admin)
+        .merge(plugin_only)
+        .route("/health", get(|| async { "ok" }))
+        .route("/ws", get(ws_handler))
+        .route("/api/redeem", post(redeem))
+        .route("/api/status", get(status))
         .route("/api/files/{space}", get(crate::files_api::files))
         .route("/api/file/{space}/{doc}", get(crate::files_api::file))
         .layer(DefaultBodyLimit::max(MAX_BLOB))
         .with_state(app)
+}
+
+// ── Client-Version ───────────────────────────────────────────────────
+
+/// Kennung des Obsidian-Plugins im HELLO bzw. im Header `X-Tandem-Client`: `tandem-plugin/<version>`.
+pub const PLUGIN_CLIENT: &str = "tandem-plugin/";
+pub const CLIENT_HEADER: &str = "x-tandem-client";
+/// Fehlercode im ERROR-Frame, wenn die Plugin-Version nicht passt (426 ist schon „Space verschlüsselt“).
+pub const ERR_VERSION: u64 = 505;
+
+/// Der Server bedient nur das Plugin mit genau seiner eigenen Version. Andere Clients (z. B. die
+/// Lernplattform) melden sich mit eigener Kennung und sind nicht an die Plugin-Version gebunden.
+/// Ohne Kennung = Plugin vor 0.8.2.
+pub fn check_client(client: Option<&str>) -> Result<(), String> {
+    match client {
+        Some(c) if !c.is_empty() && !c.starts_with(PLUGIN_CLIENT) => Ok(()),
+        _ => check_plugin(client.and_then(|c| c.strip_prefix(PLUGIN_CLIENT))),
+    }
+}
+
+/// `version`: Version aus `tandem-plugin/<version>`, `None` = keine Plugin-Kennung (Plugin vor 0.8.2).
+pub fn check_plugin(version: Option<&str>) -> Result<(), String> {
+    let server = env!("CARGO_PKG_VERSION");
+    if version == Some(server) {
+        return Ok(());
+    }
+    let plugin = version.unwrap_or("vor 0.8.2");
+    Err(format!(
+        "Tandem-Server {server} bedient nur Tandem-Plugin {server} (dieses Gerät: {plugin}). Plugin aktualisieren: Einstellungen → Tandem → Version."
+    ))
+}
+
+/// Für die Plugin-Routen: Header `X-Tandem-Client: tandem-plugin/<version>` mit passender Version.
+async fn require_plugin_header(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let version = req.headers().get(CLIENT_HEADER).and_then(|v| v.to_str().ok()).and_then(|c| c.strip_prefix(PLUGIN_CLIENT));
+    match check_plugin(version) {
+        Ok(()) => next.run(req).await,
+        Err(msg) => (StatusCode::UPGRADE_REQUIRED, msg).into_response(),
+    }
 }
 
 // ── WebSocket ────────────────────────────────────────────────────────
@@ -72,7 +115,13 @@ async fn handle_socket(socket: WebSocket, app: App) {
         _ => return,
     };
     let (user, bound, device, token_hash) = match codec::decode_client(&hello) {
-        Ok(Frame::Hello { version: 1, token, device }) => {
+        Ok(Frame::Hello { version: 1, token, device, client }) => {
+            if let Err(msg) = check_client(client) {
+                debug!(device, client, "Plugin-Version passt nicht – abgelehnt");
+                let _ = sink.send(Message::Binary(codec::error(ERR_VERSION, "", &msg).into())).await;
+                let _ = sink.close().await;
+                return;
+            }
             let u = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).auth(token).ok().flatten();
             match u {
                 Some((u, bound)) => {
@@ -562,5 +611,32 @@ async fn history_get(State(app): State<App>, h: HeaderMap, Path((space, doc, ts)
     match app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).snapshot(&name, ts) {
         Ok(Some(d)) => ([(header::CONTENT_TYPE, "application/octet-stream")], d).into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod client_version_tests {
+    use super::*;
+    const V: &str = env!("CARGO_PKG_VERSION");
+
+    #[test]
+    fn nur_passendes_plugin() {
+        assert!(check_client(Some(&format!("tandem-plugin/{V}"))).is_ok());
+        assert!(check_client(Some("tandem-plugin/0.0.1")).unwrap_err().contains("0.0.1"));
+        assert!(check_client(None).unwrap_err().contains("vor 0.8.2"));
+        assert!(check_client(Some("")).is_err());
+        assert!(check_client(Some("tandem-plugin/")).is_err());
+    }
+
+    #[test]
+    fn andere_clients_frei() {
+        assert!(check_client(Some("lernplattform")).is_ok());
+    }
+
+    #[test]
+    fn http_nur_plugin() {
+        assert!(check_plugin(Some(V)).is_ok());
+        assert!(check_plugin(None).is_err());
+        assert!(check_plugin(Some("0.0.1")).is_err());
     }
 }

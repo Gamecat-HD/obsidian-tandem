@@ -1,7 +1,7 @@
 // Geräte gehören zu einem Vault: Zwei Vaults auf einem Rechner sind zwei Einträge, jeder lässt sich für sich
 // verwalten, und ein Zugang kommt nur an seinen Vault. Echte Obsidian-Instanzen gegen den Rust-Server.
 import { createHmac } from "node:crypto";
-import { check, client, idle, readFile, startServer, status, waitFor } from "../lib.mjs";
+import { CLIENT, check, client, idle, readFile, startServer, status, waitFor } from "../lib.mjs";
 
 function totp(secret, t = Date.now() / 1000) {
 	const alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -50,7 +50,7 @@ export default async function () {
 
 		// 2. Der Zugang kommt nur noch an diesen Vault – auch über HTTP
 		const tok = server.tokens.alice;
-		const get = (p) => fetch(`${server.url}${p}`, { headers: { Authorization: `Bearer ${tok}` } }).then((r) => r.status);
+		const get = (p) => fetch(`${server.url}${p}`, { headers: { Authorization: `Bearer ${tok}`, "X-Tandem-Client": CLIENT } }).then((r) => r.status);
 		check((await get("/api/members/test")) === 200, "HTTP: eigener Vault erlaubt");
 		check((await get("/api/members/zweit")) === 403, "HTTP: anderer Vault der Person abgelehnt");
 

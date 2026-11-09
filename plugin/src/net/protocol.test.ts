@@ -8,6 +8,7 @@ const FILE = resolve(__dirname, "../../../protocol/vectors.json");
 
 const frames: [string, Frame][] = [
 	["hello", { type: Msg.Hello, version: 1, token: "abc123", device: "iPad Pro ✏️" }],
+	["hello-client", { type: Msg.Hello, version: 1, token: "abc123", device: "iPad Pro ✏️", client: "tandem-plugin/0.6.4" }],
 	["welcome", { type: Msg.Welcome, info: { user: { id: "u", name: "Ünal", color: "#e5534b" }, spaces: [{ id: "s", name: "S", role: "write" }] } }],
 	["sync-step1", { type: Msg.Sync, doc: "space/_index", sub: 0, data: new Uint8Array([0]) }],
 	["sync-update", { type: Msg.Sync, doc: "space/abc", sub: 2, data: new Uint8Array(300).map((_, i) => i % 256) }],

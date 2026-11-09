@@ -3,7 +3,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { readdir, readFile as readFs } from "node:fs/promises";
 import { join } from "node:path";
-import { check, client, cursorTo, editorText, idle, isBound, openFile, readFile, startServer, type, waitFor } from "../lib.mjs";
+import { CLIENT, check, client, cursorTo, editorText, idle, isBound, openFile, readFile, startServer, type, waitFor } from "../lib.mjs";
 
 const PASS = "korrekt pferd batterie heftklammer";
 const ITER = 100_000; // kleinste erlaubte Rundenzahl – hält den Test schnell
@@ -122,7 +122,7 @@ export default async function () {
 		check(before >= 64, `Log wurde verdichtet: ${before} → ${rows()} Zeilen`);
 		const snaps = await a.evaluate((id) => app.plugins.plugins.tandem.api.history(id), docId);
 		check(snaps.length >= 1, `Verdichteter Stand dient als Fassung der Versionsgeschichte (${snaps.length})`);
-		const sr = await fetch(`${base.url}/api/history/enc/${docId}/${snaps[0].ts}`, { headers: { Authorization: `Bearer ${base.tokens.alice}` } });
+		const sr = await fetch(`${base.url}/api/history/enc/${docId}/${snaps[0].ts}`, { headers: { Authorization: `Bearer ${base.tokens.alice}`, "X-Tandem-Client": CLIENT } });
 		const sdata = Buffer.from(await sr.arrayBuffer());
 		const snapText = { len: sdata.length, plain: sdata.includes(Buffer.from("Lissabon")) };
 		const snapPlain = await a.evaluate((id, ts) => app.plugins.plugins.tandem.api.snapshotText(id, ts), docId, snaps[0].ts);
@@ -154,7 +154,7 @@ export default async function () {
 		check(api.status === 409, `Lese-API verweigert verschlüsselte Vaults (${api.status})`);
 		const bad = await fetch(`${base.url}/api/e2ee/enc`, {
 			method: "POST",
-			headers: { Authorization: `Bearer ${base.tokens.alice}`, "Content-Type": "application/json" },
+			headers: { Authorization: `Bearer ${base.tokens.alice}`, "Content-Type": "application/json", "X-Tandem-Client": CLIENT },
 			body: JSON.stringify({ v: 1, kdf: "pbkdf2-sha256", iter: 100000, salt: "AAAA", check: "AAAA" }),
 		});
 		check(bad.status === 409, `Schlüssel lässt sich bei vorhandenem Inhalt nicht mehr austauschen (${bad.status})`);

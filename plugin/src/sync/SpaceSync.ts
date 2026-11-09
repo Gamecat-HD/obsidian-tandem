@@ -34,7 +34,7 @@ export interface SpaceSyncOptions {
 	space: string;
 	ignore: RegExp[];
 	user(): { id: string; name: string; color: string };
-	http(): { base: string; token: string };
+	http(): { base: string; token: string; headers: Record<string, string> };
 	log?(msg: string): void;
 	/** Ende-zu-Ende-verschlüsselter Space: Schlüssel (sonst null). */
 	key?: SpaceKey | null;

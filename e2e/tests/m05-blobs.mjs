@@ -1,5 +1,5 @@
 // M5: Anhänge (PDF/Bilder/Binärdateien) – Hochladen, Ändern, Umbenennen, Löschen, Konfliktkopie, Deduplizierung.
-import { check, client, idle, startServer, status, waitFor } from "../lib.mjs";
+import { CLIENT, check, client, idle, startServer, status, waitFor } from "../lib.mjs";
 
 const putBin = (h, path, seed, size) =>
 	h.evaluate(async (path, seed, size) => {
@@ -92,7 +92,7 @@ export default async function () {
 		check(hashes.includes(ha) && hashes.includes(hb), `beide Fassungen bleiben erhalten: ${all.join(", ")}`);
 
 		// 7. Ohne Berechtigung kein Zugriff auf Blobs
-		const r = await fetch(`${server.url}/api/blob/test/${h1}`);
+		const r = await fetch(`${server.url}/api/blob/test/${h1}`, { headers: { "X-Tandem-Client": CLIENT } });
 		check(r.status === 401, `Blob ohne Token: HTTP ${r.status}`);
 		const errs = [a, b].flatMap((h) => h.logs).filter((l) => /\[exception\]|\[error\]/.test(l));
 		check(errs.length === 0, `keine Fehler im Log${errs.length ? ": " + errs.slice(0, 3).join(" | ") : ""}`);

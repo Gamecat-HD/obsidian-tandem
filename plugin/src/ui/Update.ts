@@ -28,8 +28,11 @@ export function newer(a: string, b: string): boolean {
 	return !x.pre && !!y.pre;
 }
 
-export async function latestRelease(): Promise<Release> {
-	const r = await requestUrl({ url: `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, headers: { Accept: "application/vnd.github+json" }, throw: false });
+/** Neuestes Release – oder mit `version` genau dieses (passend zur Server-Version). */
+export async function latestRelease(version?: string): Promise<Release> {
+	const path = version ? `tags/${encodeURIComponent(version)}` : "latest";
+	const r = await requestUrl({ url: `https://api.github.com/repos/${UPDATE_REPO}/releases/${path}`, headers: { Accept: "application/vnd.github+json" }, throw: false });
+	if (r.status === 404 && version) throw new Error(`Kein Release ${version} auf GitHub`);
 	if (r.status !== 200) throw new Error(r.status === 403 ? "GitHub-Abfragegrenze erreicht – später erneut versuchen" : `GitHub antwortet mit HTTP ${r.status}`);
 	const j = r.json as { tag_name: string; html_url: string; body?: string; assets: { name: string; browser_download_url: string }[] };
 	return { version: j.tag_name.replace(/^v/, ""), url: j.html_url, notes: j.body ?? "", assets: Object.fromEntries(j.assets.map((a) => [a.name, a.browser_download_url])) };

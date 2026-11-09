@@ -12,6 +12,7 @@ const Y = require("yjs");
 const encoding = require("lib0/encoding");
 const decoding = require("lib0/decoding");
 const WebSocket = require("ws");
+const CLIENT = `tandem-plugin/${require("./manifest.json").version}`;
 const REMOTE = Symbol("remote");
 const frame = (fn) => {
 	const e = encoding.createEncoder();
@@ -25,7 +26,7 @@ function connect(url, token) {
 	const docs = new Map();
 	const send = (doc, fn) => ws.send(frame((e) => (encoding.writeVarUint(e, 2), encoding.writeVarString(e, doc), fn(e))));
 	const ready = new Promise((ok, fail) => {
-		ws.on("open", () => ws.send(frame((e) => (encoding.writeVarUint(e, 0), encoding.writeVarUint(e, 1), encoding.writeVarString(e, token), encoding.writeVarString(e, "e2e")))));
+		ws.on("open", () => ws.send(frame((e) => (encoding.writeVarUint(e, 0), encoding.writeVarUint(e, 1), encoding.writeVarString(e, token), encoding.writeVarString(e, "e2e"), encoding.writeVarString(e, CLIENT)))));
 		ws.on("error", fail);
 		ws.on("message", (raw) => {
 			const d = decoding.createDecoder(new Uint8Array(raw));
@@ -67,7 +68,7 @@ try {
 	empty.getMap("meta").set("head", JSON.stringify({ v: 1, w: 800, h: 200 }));
 	const png = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
 	const hash = createHash("sha256").update(png).digest("hex");
-	const put = await fetch(`${srv.url}/api/blob/test/${hash}`, { method: "PUT", headers: { Authorization: `Bearer ${srv.tokens.alice}` }, body: png });
+	const put = await fetch(`${srv.url}/api/blob/test/${hash}`, { method: "PUT", headers: { Authorization: `Bearer ${srv.tokens.alice}`, "X-Tandem-Client": CLIENT }, body: png });
 	assert.ok(put.ok, `Upload ${put.status}`);
 	const files = index.getMap("files");
 	const ts = Date.now();

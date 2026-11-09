@@ -1,7 +1,7 @@
 import { MarkdownView, Notice, Platform, Plugin, requestUrl, SuggestModal, type App } from "obsidian";
 import type { Extension } from "@codemirror/state";
 import * as Y from "yjs";
-import { Connection, type ConnStatus } from "./net/Connection";
+import { Connection, ERR_VERSION, type ConnStatus } from "./net/Connection";
 import { LocalStore } from "./docs/LocalStore";
 import { collabBaseExtension } from "./editor/collab";
 import { SpaceSync, type ReferencedDelete } from "./sync/SpaceSync";
@@ -57,6 +57,8 @@ export default class TandemPlugin extends Plugin {
 	private decryptWarned = false;
 	/** Neuere Version auf GitHub (nach der letzten Prüfung), sonst null. */
 	update: Release | null = null;
+	/** Server-Version, wenn der Server diese Plugin-Version abgelehnt hat. */
+	serverVersion: string | null = null;
 
 	get token(): string {
 		return (this.app.loadLocalStorage(LS_TOKEN) as string | null) ?? "";
@@ -214,12 +216,16 @@ export default class TandemPlugin extends Plugin {
 			return;
 		}
 		const url = this.settings.serverUrl.replace(/\/+$/, "").replace(/^http/, "ws") + "/ws";
-		const conn = new Connection({ url, token: this.token, device: this.device });
+		const conn = new Connection({ url, token: this.token, device: this.device, client: this.clientId() });
 		this.conn = conn;
 		conn.onStatus((s) => this.renderStatus(s));
 		conn.onStatus((s) => {
 			const u = conn.welcome?.user;
 			if (s === "online" && u) this.app.saveLocalStorage(LS_USER, JSON.stringify({ id: u.id, name: u.name, color: u.color }));
+		});
+		// Früh anhängen: Die Ablehnung kommt als Antwort auf HELLO, noch während unten gewartet wird.
+		conn.onError((code, doc, msg) => {
+			if (code === ERR_VERSION && !doc && this.conn === conn) void this.versionMismatch(msg);
 		});
 		// Erst die Anmeldung abwarten: WELCOME sagt, ob der Space Ende-zu-Ende-verschlüsselt ist.
 		conn.start();
@@ -227,7 +233,7 @@ export default class TandemPlugin extends Plugin {
 			if (conn.status === "online") return ok();
 			const t = window.setTimeout(done, 6000);
 			const off = conn.onStatus((s) => {
-				if (s === "online" || s === "unauthorized") done();
+				if (s === "online" || s === "unauthorized" || s === "outdated") done();
 			});
 			function done() {
 				window.clearTimeout(t);
@@ -311,7 +317,7 @@ export default class TandemPlugin extends Plugin {
 		conn.onError((code, doc, msg) => {
 			if (code === 401) new Notice("Tandem: Anmeldung abgelehnt – bitte neu einladen lassen (Einstellungen).");
 			else if (code === 426 && this.conn === conn) void this.restart(); // Space wurde verschlüsselt
-			else console.warn("[tandem] Serverfehler", code, doc, msg);
+			else if (code !== ERR_VERSION) console.warn("[tandem] Serverfehler", code, doc, msg);
 		});
 		const user = () => this.userInfo();
 		const sync = new SpaceSync({
@@ -411,8 +417,29 @@ export default class TandemPlugin extends Plugin {
 		}));
 	}
 
+	/** Kennung gegenüber dem Server; der bedient nur das Plugin mit genau seiner Version. */
+	clientId() {
+		return `tandem-plugin/${this.manifest.version}`;
+	}
+
 	http() {
-		return { base: this.settings.serverUrl.replace(/\/+$/, ""), token: this.token };
+		const token = this.token;
+		return { base: this.settings.serverUrl.replace(/\/+$/, ""), token, headers: { Authorization: `Bearer ${token}`, "X-Tandem-Client": this.clientId() } };
+	}
+
+	/** Server lehnt diese Plugin-Version ab → passendes Release (= Server-Version) zum Installieren anbieten. */
+	private async versionMismatch(msg: string) {
+		const server = /Tandem-Server (\S+)/.exec(msg)?.[1];
+		this.serverVersion = server ?? null;
+		this.renderStatus("outdated");
+		new Notice(`Tandem: ${msg}`, 0);
+		// Den Knopf „Auf <Server-Version> aktualisieren“ in den Einstellungen vorbereiten.
+		if (server)
+			try {
+				this.update = await latestRelease(server);
+			} catch (e) {
+				console.warn("[tandem] Release zur Server-Version nicht gefunden", e);
+			}
 	}
 
 	// ── Updates ──────────────────────────────────────────────────────────
@@ -420,9 +447,11 @@ export default class TandemPlugin extends Plugin {
 	/** Neueste Version auf GitHub abfragen. `quiet`: Fehler und „aktuell“ nicht melden. */
 	async checkUpdate(quiet: boolean): Promise<Release | null> {
 		try {
-			const rel = await latestRelease();
+			// Lehnt der Server diese Version ab, zählt seine Version – auch wenn sie älter ist.
+			const target = this.serverVersion && this.serverVersion !== this.manifest.version ? this.serverVersion : undefined;
+			const rel = await latestRelease(target);
 			this.app.saveLocalStorage(LS_UPDATE_CHECK, String(Date.now()));
-			this.update = newer(rel.version, this.manifest.version) ? rel : null;
+			this.update = target || newer(rel.version, this.manifest.version) ? rel : null;
 			if (this.update) new Notice(`Tandem ${rel.version} ist verfügbar (installiert: ${this.manifest.version}). Einstellungen → Tandem → „Aktualisieren“.`, 12000);
 			else if (!quiet) new Notice(`Tandem ${this.manifest.version} ist aktuell.`);
 			return this.update;
@@ -484,12 +513,12 @@ export default class TandemPlugin extends Plugin {
 	/** Verschlüsselung für den (leeren) Space einrichten – nur Besitzer. */
 	async setupE2ee(passphrase: string, iter?: number): Promise<void> {
 		const { params, key } = await createParams(this.settings.space, passphrase, iter);
-		const { base, token } = this.http();
+		const { base, headers } = this.http();
 		const r = await requestUrl({
 			url: `${base}/api/e2ee/${encodeURIComponent(this.settings.space)}`,
 			method: "POST",
 			contentType: "application/json",
-			headers: { Authorization: `Bearer ${token}` },
+			headers,
 			body: JSON.stringify(params),
 			throw: false,
 		});
@@ -543,7 +572,7 @@ export default class TandemPlugin extends Plugin {
 		const el = this.statusEl;
 		if (!el) return;
 		el.empty();
-		const label = { offline: "offline", connecting: "verbinde …", online: "online", unauthorized: "nicht angemeldet" }[s];
+		const label = { offline: "offline", connecting: "verbinde …", online: "online", unauthorized: "nicht angemeldet", outdated: "Plugin-Version passt nicht" }[s];
 		el.createSpan({ cls: `tandem-dot tandem-${s}` });
 		el.createSpan({ text: ` Tandem ${note ?? label}` });
 		if (this.key && s === "online" && !note) el.createSpan({ cls: "tandem-lock", text: " 🔒", attr: { "aria-label": "Ende-zu-Ende-verschlüsselt" } });
@@ -570,12 +599,12 @@ export default class TandemPlugin extends Plugin {
 
 	/** Einladungscode erzeugen (nur Besitzer). Legt die Person bei Bedarf an. */
 	async createInvite(user: string, name: string, role: "write" | "read" | "owner" | undefined, hours = 168): Promise<{ code: string; user: string; role: string; hours: number }> {
-		const { base, token } = this.http();
+		const { base, headers } = this.http();
 		const r = await requestUrl({
 			url: `${base}/api/invite`,
 			method: "POST",
 			contentType: "application/json",
-			headers: { Authorization: `Bearer ${token}` },
+			headers,
 			body: JSON.stringify({ space: this.settings.space, user, name, role, hours }),
 			throw: false,
 		});
@@ -584,8 +613,8 @@ export default class TandemPlugin extends Plugin {
 	}
 
 	async members(): Promise<{ id: string; name: string; color: string; role: string; devices: { device: string; lastSeen: number | null }[] }[]> {
-		const { base, token } = this.http();
-		const r = await requestUrl({ url: `${base}/api/members/${encodeURIComponent(this.settings.space)}`, headers: { Authorization: `Bearer ${token}` }, throw: false });
+		const { base, headers } = this.http();
+		const r = await requestUrl({ url: `${base}/api/members/${encodeURIComponent(this.settings.space)}`, headers, throw: false });
 		if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
 		return r.json;
 	}
