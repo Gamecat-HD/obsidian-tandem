@@ -1,6 +1,6 @@
 # Änderungen
 
-## Unveröffentlicht
+## 0.8.0
 
 Nur das Plugin hat sich geändert; der Server muss nicht neu ausgerollt werden.
 

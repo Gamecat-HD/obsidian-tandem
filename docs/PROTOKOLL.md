@@ -64,7 +64,7 @@ Authentifizierung: `Authorization: Bearer <token>`.
 - `md`/`text`: `Y.Text("content")`
 - `ink`: `Y.Map("meta")` (`head` = JSON-Kopf der .ink-Datei ohne `strokes`), `Y.Map("strokes")` (`id → Strich-JSON-Zeile`), `Y.Array("order")` (Stroke-IDs)
 - `blob`: kein Doc, Inhalt über HTTP nach `hash`.
-- Alle Docs außer `_index` (ab Plugin 0.8): Autorenschaft für Blame (`plugin/src/blame/authorship.ts`)
+- Alle Docs außer `_index` (ab Plugin 0.8.0): Autorenschaft für Blame (`plugin/src/blame/authorship.ts`)
   - `Y.Map("tandem:authors")`: `clientID (als Text) → {id, name, color, device?}`, einmal pro Doc-Instanz beim ersten Schreiben
   - `Y.Array("tandem:marks")`: `[clientID, clock, Zeit in ms, Quelle (0 = Editor, 1 = Datei von außen)]`, höchstens eine Marke pro Minute und Instanz. Ein Zeichen `(client, clock)` gilt als zur Zeit der letzten Marke mit gleicher clientID und `clock ≤` geschrieben.
 
