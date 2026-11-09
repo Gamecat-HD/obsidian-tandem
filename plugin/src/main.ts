@@ -7,6 +7,7 @@ import { SpaceSync, type ReferencedDelete } from "./sync/SpaceSync";
 import { Presence, initials, type Peer } from "./presence/Presence";
 import { DEFAULT_SETTINGS, formatSize, TandemSettingTab, type TandemSettings } from "./settings";
 import { InkBridge } from "./ink/InkBridge";
+import { LiveApi } from "./live/LiveApi";
 import { HistoryModal, listSnapshots, loadSnapshot } from "./ui/History";
 import { backupVault, canBackup } from "./ui/Backup";
 import { createParams, SpaceKey, b64, unb64, unlock } from "./crypto/e2ee";
@@ -37,6 +38,8 @@ export default class TandemPlugin extends Plugin {
 	private stopFollow: (() => void) | null = null;
 	private hiddenTimer: number | null = null;
 	api: Record<string, unknown> = {};
+	/** Live-Schnittstelle für Partner-Plugins (Zellwerk). */
+	live = new LiveApi({ sync: () => this.sync, user: () => this.userInfo() });
 	/** Schlüssel des aktuellen Space (verschlüsselt) bzw. null. */
 	key: SpaceKey | null = null;
 	/** Aktueller Modus des Space (nach dem Start). */
@@ -87,6 +90,7 @@ export default class TandemPlugin extends Plugin {
 			e2eeSetup: (passphrase: string, iter?: number) => this.setupE2ee(passphrase, iter),
 			e2eeUnlock: (passphrase: string) => this.unlockWith(passphrase),
 			e2eeForget: () => this.forgetKey(),
+			live: this.live.facade(),
 		};
 
 		this.addCommand({ id: "connect", name: "Verbinden / neu verbinden", callback: () => void this.restart() });
@@ -288,7 +292,7 @@ export default class TandemPlugin extends Plugin {
 			else if (code === 426 && this.conn === conn) void this.restart(); // Space wurde verschlüsselt
 			else console.warn("[tandem] Serverfehler", code, doc, msg);
 		});
-		const user = () => conn.welcome?.user ?? { id: "local", name: this.settings.displayName || "Ich", color: "#888888" };
+		const user = () => this.userInfo();
 		const sync = new SpaceSync({
 			app: this.app,
 			conn,
@@ -310,6 +314,7 @@ export default class TandemPlugin extends Plugin {
 			log: (m) => console.log("[tandem]", m),
 			key: this.key,
 			onReferencedDelete: (items, restore) => this.warnReferencedDelete(items, restore),
+			represented: (path, hash) => this.live.represented(path, hash),
 			onTransferLost: (t) => {
 				const name = t.path.split("/").pop();
 				new Notice(`Tandem: Beim Übertragen von „${name}“${formatSize(t.size)} wurde die App beendet. Die Datei wird auf diesem Gerät übersprungen. Erneut versuchen: Einstellungen → Tandem.`, 20000);
@@ -339,6 +344,11 @@ export default class TandemPlugin extends Plugin {
 		this.registerEvent(this.app.workspace.on("layout-change", () => this.presence?.renderHeaders()));
 		this.ink = new InkBridge(this.app, sync);
 		this.ink.start();
+	}
+
+	/** Angemeldete Person (oder Platzhalter, solange keine Verbindung besteht). */
+	userInfo(): { id: string; name: string; color: string } {
+		return this.conn?.welcome?.user ?? { id: "local", name: this.settings.displayName || "Ich", color: "#888888" };
 	}
 
 	http() {
@@ -456,6 +466,7 @@ export default class TandemPlugin extends Plugin {
 		this.follow(null);
 		this.ink?.stop();
 		this.ink = null;
+		this.live.closeAll();
 		this.presence?.destroy();
 		this.presence = null;
 		await this.sync?.stop();

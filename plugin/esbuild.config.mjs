@@ -30,6 +30,10 @@ const context = await esbuild.context({
 	sourcemap: prod ? false : "inline",
 	treeShaking: true,
 	outfile: "main.js",
+	// Partner-Plugins (Zellwerk, …) bringen eigene Yjs-Kopien mit und tauschen nur Bytes aus –
+	// die Doppel-Import-Warnung von Yjs ist hier unbegründet.
+	banner: { js: 'var __tdYjs = globalThis["__ $YJS$ __"]; delete globalThis["__ $YJS$ __"];' },
+	footer: { js: 'if (__tdYjs) globalThis["__ $YJS$ __"] = true;' },
 	minify: prod,
 });
 

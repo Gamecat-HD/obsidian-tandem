@@ -1,10 +1,14 @@
 # Änderungen
 
-## Nächste Version
+## 0.7.0
 
-Nur das Plugin hat sich geändert.
+Nur das Plugin hat sich geändert; der Server muss nicht neu ausgerollt werden (Begleit-Dokumente der Live-API sind normale Docs mit der ID `<docId>-live`).
 
 - **Warnung, wenn ein gelöschter Anhang noch verwendet wird:** Löscht jemand ein Bild oder PDF, das eine Notiz noch nutzt, erscheint auf allen Geräten ein Hinweis mit „Wiederherstellen“: wer gelöscht hat und welche Notizen betroffen sind. Ein Klick holt den Anhang auf alle Geräte zurück. Das gilt auch für Hintergründe von Ink-Blöcken. Die stehen in einem Codeblock, Obsidian erkennt sie nicht als Link, und die Datei wirkt ungenutzt. Unbenutzte Anhänge und ganze gelöschte Ordner lösen keinen Hinweis aus. Test `m21`.
+- **Live-API für Partner-Plugins (`api.live`):** Zu jeder als Anhang synchronisierten Datei gibt es auf Wunsch ein Begleit-Dokument mit Präsenz. Partner tauschen Yjs-Updates als Bytes aus, jede Seite behält ihre eigene Yjs-Kopie. Erster Partner: [Zellwerk](https://github.com/Gamecat-HD/obsidian-zellwerk) – Excel-Tabellen live gemeinsam bearbeiten. Beschreibung: `docs/LIVE-API.md`. Test `m20`.
+- **Keine Konfliktkopie, wenn der Partner zusammenführt:** Steckt die lokale Fassung einer Datei schon im Begleit-Dokument (`registerFileType(…).represented`), legt Tandem bei gleichzeitigen Änderungen keine Konfliktkopie an.
+- **Änderung kurz nach einem Download ging verloren:** Wurde ein Anhang in den 2 Sekunden nach Tandems eigenem Schreiben erneut geändert (z. B. Excel-Datei aus einem anderen Programm), hat Tandem die Änderung ignoriert. Jetzt wird jede Änderung geprüft; der Upload vergleicht ohnehin den Hash und tut bei der eigenen Fassung nichts.
+- Die Yjs-Warnung „Yjs was already imported“ erscheint nicht mehr, wenn Partner-Plugins eine eigene Yjs-Kopie mitbringen.
 
 ## 0.6.4
 
