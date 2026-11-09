@@ -1,5 +1,13 @@
 # Änderungen
 
+## 0.9.0
+
+Am Server ändert sich nur die Versionsnummer. Er muss trotzdem mit ausgerollt werden, weil Plugin und Server seit 0.8.2 dieselbe Version haben müssen.
+
+- **Blame schöner – der Text bleibt, wo er ist:** Statt einer breiten Spalte, die den Text zusammengeschoben hat, gibt es einen schmalen Farbbalken links vom Text. Name und Zeit („Nico · 3 Std.“) stehen im freien Rand, eigene Zeilen als „Du“. Ist kein Platz im Rand (Handy, schmales Fenster), steht die Angabe dezent am Ende der Zeile mit dem Cursor. Text unbekannter Herkunft bekommt nur einen gepunkteten Balken statt „?“. Überfahren zeigt wie bisher Gerät, Zeit und weitere Beteiligte.
+- **Blame in Ink Blocks:** Mit Ink Blocks ab 0.7.0 bekommt jeder Strich einen weichen Schein in der Farbe der Person, die ihn gezeichnet hat. Oben rechts steht eine Legende (wer, wann zuletzt). Fährt man mit Maus oder Stift über einen Strich, erscheinen Name, Gerät und Zeit. Test `m23`.
+- **Weniger Daten, weniger Rechenarbeit:** Das Format im Doc ist kompakter (`tandem:p`/`tandem:a`/`tandem:t`): Zeitmarken ohne clientID, Sekunden als kleine Ganzzahl, und neue Marken nur nach einer Schreibpause oder alle 10 Minuten. Statt ~27 Byte pro Minute Schreiben kostet Blame jetzt unter 4 Byte. Die Zuordnung wird zwischengespeichert und nur nach einer Tipppause (spätestens alle 2 s) neu berechnet; gezeichnet wird nur der sichtbare Bereich. Daten aus 0.8.0 werden weiter gelesen.
+- **„Wer zuletzt?“ stimmt auch beim gleichzeitigen Schreiben:** Wer nach Änderungen anderer schreibt, bekommt eine Zeitmarke, die immer danach liegt (logische Uhr). Auch wenn die Uhr eines Geräts falsch geht.
 ## 0.8.2
 
 **Server und Plugin müssen jetzt dieselbe Version haben.** Plugin und Server immer zusammen aktualisieren.

@@ -15,6 +15,8 @@
 import type { App } from "obsidian";
 import type { Awareness } from "y-protocols/awareness";
 import type { SpaceSync } from "../sync/SpaceSync";
+import type * as Y from "yjs";
+import { AuthorLookup, mapOrigins, type Author } from "../blame/authorship";
 
 const INK_PLUGIN = "obsidian-ink-blocks";
 const SEND_EVERY = 40;
@@ -40,6 +42,35 @@ interface InkApiV1 {
 	onPointer?(fn: (file: string, p: PointerPos | null) => void): () => void;
 	exclusive?<T>(file: string, fn: () => Promise<T>): Promise<T>;
 	setRemotePointer?(file: string, key: string, p: PointerPos | null, label?: { name: string; color: string }): void;
+	// ab Ink Blocks mit Blame-Anzeige (optional)
+	setBlame?(file: string, blame: InkBlame | null): void;
+}
+
+/** Wer hat welchen Strich gezeichnet (für Ink Blocks `setBlame`). */
+export interface InkBlame {
+	authors: { key: string; name: string; color: string; device?: string; you?: boolean }[];
+	/** Strich-ID → [Index in `authors`, Zeit in ms oder null] – Striche unbekannter Herkunft fehlen */
+	strokes: Record<string, [number, number | null]>;
+}
+
+/** Strich-Zuordnung eines Ink-Docs berechnen. */
+export function inkBlame(doc: Y.Doc, lookup: AuthorLookup, you?: string): InkBlame {
+	const authors: InkBlame["authors"] = [];
+	const index = new Map<string, number>();
+	const strokes: InkBlame["strokes"] = {};
+	for (const [id, o] of mapOrigins(doc.getMap("strokes"))) {
+		const w = lookup.who(o.client, o.clock);
+		const a = w.author;
+		if (!a) continue;
+		const key = `${a.id}|${a.device ?? ""}`;
+		let i = index.get(key);
+		if (i === undefined) {
+			index.set(key, (i = authors.length));
+			authors.push({ key, name: a.name, color: a.color, ...(a.device ? { device: a.device } : {}), ...(a.id === you ? { you: true } : {}) });
+		}
+		strokes[id] = [i, w.ts];
+	}
+	return { authors, strokes };
 }
 
 interface PointerPos {
@@ -93,11 +124,61 @@ export class InkBridge {
 	private ptrSeen = new Map<number, string>();
 	/** .ink-docIds, die wir wegen offener Zeichenansicht abonniert halten */
 	private held = new Set<string>();
+	// Blame: docId → {Pfad, Abmelden, Zuordnung (zwischengespeichert)}
+	private blameOn = false;
+	private blamed = new Map<string, { path: string; off: () => void; lookup: AuthorLookup | null; timer: number | null }>();
 
 	constructor(
 		readonly app: App,
 		readonly sync: SpaceSync,
+		/** Eigene Person (Blame: „Du“, eigene clientID vor dem ersten Eintrag) */
+		readonly me: () => Author | null = () => null,
 	) {}
+
+	/** Blame-Anzeige in Ink Blocks ein-/ausschalten (falls Ink Blocks sie anbietet). */
+	setBlame(on: boolean) {
+		this.blameOn = on;
+		if (on) this.holdOpen();
+		else for (const id of [...this.blamed.keys()]) this.unblame(id);
+	}
+
+	private blame(id: string, path: string) {
+		const api = this.api;
+		if (!api?.setBlame || this.blamed.has(id)) return;
+		void this.sync.docs.acquire(id).then((s) => {
+			if (!this.blameOn || !this.held.has(id) || this.blamed.has(id)) return this.sync.docs.release(id);
+			const doc = s.doc;
+			const entry = { path, lookup: null as AuthorLookup | null, timer: null as number | null, off: () => {} };
+			const push = () => {
+				entry.timer = null;
+				const me = this.me();
+				entry.lookup ??= new AuthorLookup(doc, (c) => (c === doc.clientID ? (me ?? undefined) : undefined));
+				api.setBlame?.(entry.path, inkBlame(doc, entry.lookup, me?.id));
+			};
+			const schedule = () => {
+				if (entry.timer === null) entry.timer = window.setTimeout(push, 400);
+			};
+			const offMeta = AuthorLookup.watch(doc, () => (entry.lookup = null));
+			const strokes = doc.getMap("strokes");
+			strokes.observe(schedule);
+			entry.off = () => {
+				offMeta();
+				strokes.unobserve(schedule);
+				if (entry.timer !== null) window.clearTimeout(entry.timer);
+				this.sync.docs.release(id);
+			};
+			this.blamed.set(id, entry);
+			push();
+		});
+	}
+
+	private unblame(id: string) {
+		const e = this.blamed.get(id);
+		if (!e) return;
+		this.blamed.delete(id);
+		e.off();
+		this.api?.setBlame?.(e.path, null);
+	}
 
 	get stage(): "A" | "B" {
 		return this.api ? "B" : "A";
@@ -277,12 +358,12 @@ export class InkBridge {
 	private holdOpen() {
 		const api = this.api;
 		if (!api) return;
-		const want = new Set<string>();
+		const want = new Map<string, string>();
 		for (const f of api.openFiles()) {
 			const id = this.sync.index.idForPath(f);
-			if (id) want.add(id);
+			if (id) want.set(id, f);
 		}
-		for (const id of want) {
+		for (const id of want.keys()) {
 			if (this.held.has(id)) continue;
 			this.held.add(id);
 			void this.sync.docs.acquire(id);
@@ -290,11 +371,19 @@ export class InkBridge {
 		for (const id of [...this.held]) {
 			if (want.has(id)) continue;
 			this.held.delete(id);
+			this.unblame(id);
 			this.sync.docs.release(id);
+		}
+		if (!this.blameOn) return;
+		for (const [id, path] of want) {
+			const e = this.blamed.get(id);
+			if (e && e.path !== path) this.unblame(id); // umbenannt
+			this.blame(id, path);
 		}
 	}
 
 	stop() {
+		for (const id of [...this.blamed.keys()]) this.unblame(id);
 		for (const off of this.offs) off();
 		this.offs = [];
 		for (const t of [this.probeTimer, this.openTimer]) if (t !== null) window.clearInterval(t);
