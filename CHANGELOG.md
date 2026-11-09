@@ -1,5 +1,10 @@
 # Änderungen
 
+## 0.9.1
+
+Das Plugin ändert sich nur in der Versionsnummer. Es muss trotzdem aktualisiert werden, weil Plugin und Server seit 0.8.2 dieselbe Version haben müssen.
+
+- **Offizielle Lese-API für andere Dienste** ([docs/LESE-API.md](docs/LESE-API.md)): Neu ist der Änderungs-Feed `GET /api/changes/<space>` (Server-Sent Events). Nach dem Verbinden meldet er alles, was seit `?since=<seq>` geändert wurde, danach laufend jede Änderung. Die Ereignis-ID ist die Sequenz des Space, deshalb setzt ein neuer Verbindungsaufbau per `Last-Event-ID` genau dort wieder an. Zusammen mit `/api/files` und `/api/file` ist das die „Lese-API v1“. Sie hängt nicht an der Plugin-Version und ändert sich nur abwärtskompatibel. Dienste wie die Lernplattform müssen das interne WebSocket-Protokoll damit nicht mehr nachbauen und brechen nicht mehr, wenn sich das Plugin ändert.
 ## 0.9.0
 
 Am Server ändert sich nur die Versionsnummer. Er muss trotzdem mit ausgerollt werden, weil Plugin und Server seit 0.8.2 dieselbe Version haben müssen.

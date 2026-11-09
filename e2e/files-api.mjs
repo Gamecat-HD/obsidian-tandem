@@ -52,6 +52,47 @@ function connect(url, token) {
 	return { ready, open, close: () => ws.close() };
 }
 
+// Minimaler SSE-Leser: next() liefert das nächste Ereignis ({ event, id, data }), Kommentare (KeepAlive) fallen weg
+async function openFeed(url, token, headers = {}) {
+	const ctrl = new AbortController();
+	const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, ...headers }, signal: ctrl.signal });
+	assert.equal(res.status, 200, `Feed ${res.status}`);
+	assert.match(res.headers.get("content-type"), /text\/event-stream/);
+	const reader = res.body.getReader();
+	const dec = new TextDecoder();
+	let buf = "";
+	return {
+		async next(timeoutMs = 3000) {
+			const until = Date.now() + timeoutMs;
+			for (;;) {
+				const end = buf.indexOf("\n\n");
+				if (end >= 0) {
+					const block = buf.slice(0, end);
+					buf = buf.slice(end + 2);
+					const ev = { event: "message", id: null, data: "" };
+					for (const line of block.split("\n")) {
+						const i = line.indexOf(":");
+						if (i === 0) continue;
+						const k = line.slice(0, i), v = line.slice(i + 1).replace(/^ /, "");
+						if (k === "event") ev.event = v;
+						else if (k === "id") ev.id = v;
+						else if (k === "data") ev.data += v;
+					}
+					if (!ev.data) continue;
+					ev.data = JSON.parse(ev.data);
+					return ev;
+				}
+				const left = until - Date.now();
+				assert.ok(left > 0, "kein Ereignis im Feed");
+				const r = await Promise.race([reader.read(), sleep(left).then(() => null)]);
+				assert.ok(r && !r.done, "Feed ohne Ereignis beendet");
+				buf += dec.decode(r.value, { stream: true });
+			}
+		},
+		close: () => ctrl.abort(),
+	};
+}
+
 const srv = await startRustServer({ build: !process.env.TANDEM_BIN });
 try {
 	const c = connect(srv.url, srv.tokens.alice);
@@ -100,6 +141,29 @@ try {
 	await sleep(300);
 	const after = (await (await get("/api/files/test")).json()).files.find((f) => f.id === md.id);
 	assert.ok(Number(after.rev) > Number(md.rev), "Revision steigt mit jeder Änderung");
+
+	// Änderungs-Feed (SSE): erst Nachholen, dann laufend
+	const feed = await openFeed(`${srv.url}/api/changes/test?since=0`, srv.tokens.reader);
+	const first = await feed.next();
+	assert.equal(first.event, "changes");
+	assert.equal(first.data.catchup, true);
+	assert.equal(String(first.data.seq), first.id, "Ereignis-ID = Sequenz");
+	for (const id of ["_index", "n0000000000001", "i0000000000001"]) assert.ok(first.data.docs.includes(id), `Nachholen nennt ${id}: ${first.data.docs}`);
+	note.getText("content").insert(0, "y");
+	const live = await feed.next();
+	assert.deepEqual(live.data.docs, ["n0000000000001"], "nur das geänderte Doc, ohne Space-Präfix");
+	assert.ok(live.data.seq > first.data.seq && !live.data.catchup, JSON.stringify(live.data));
+	feed.close();
+	// Wiederaufnahme per Last-Event-ID: nichts verpasst → leeres Nachholen mit gleicher Sequenz
+	const again = await openFeed(`${srv.url}/api/changes/test`, srv.tokens.reader, { "Last-Event-ID": live.id });
+	const resumed = await again.next();
+	assert.deepEqual([resumed.data.docs, resumed.data.seq, resumed.data.catchup], [[], live.data.seq, true]);
+	ink.getMap("strokes").set("s2", JSON.stringify({ id: "s2", p: [4] }));
+	assert.deepEqual((await again.next()).data.docs, ["i0000000000001"]);
+	again.close();
+	assert.equal((await get("/api/changes/test", "falsch")).status, 401);
+	assert.equal((await get("/api/changes/anderer")).status, 403);
+	// Braucht wie die übrige Lese-API keine Plugin-Kennung (s. o.: get() sendet keine)
 
 	assert.equal((await get("/api/file/test/d0000000000001")).status, 404, "gelöschte Datei");
 	assert.equal((await get("/api/files/test", "falsch")).status, 401);
