@@ -28,7 +28,8 @@ export interface BridgeHooks {
 	exclusive?<T>(path: string, fn: () => Promise<T>): Promise<T>;
 }
 
-const LOCAL = Symbol("tandem-disk");
+/** Origin für Änderungen, die aus der Datei auf der Platte stammen (fremde Schreiber, Offline-Bearbeitung). */
+export const LOCAL = Symbol("tandem-disk");
 
 export class DiskBridge {
 	/**
@@ -157,7 +158,7 @@ export class DiskBridge {
 		if (disk !== null && disk !== base && disk !== cur) {
 			if (base === undefined) {
 				// Gerät kennt die Datei noch nicht: leeres Doc → Datei hochladen, sonst Datei als Diff gegen den Server.
-				if (cur === "") ytext.insert(0, disk);
+				if (cur === "") doc.transact(() => ytext.insert(0, disk), LOCAL);
 				else applyTextDiff(ytext, cur, disk, LOCAL);
 			} else {
 				const edits = rebaseEdits(base, disk, cur);
