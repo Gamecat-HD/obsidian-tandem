@@ -238,12 +238,16 @@ struct Feed {
     seq: u64,
     queue: std::collections::VecDeque<Event>,
     checked: Instant,
+    closing: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Feed {
     /// Nächstes Ereignis; None beendet den Feed (Zugang entzogen, Server fährt herunter).
     async fn next(&mut self) -> Option<Event> {
         loop {
+            if *self.closing.borrow() {
+                return None;
+            }
             if let Some(e) = self.queue.pop_front() {
                 return Some(e);
             }
@@ -253,7 +257,11 @@ impl Feed {
                 }
                 self.checked = Instant::now();
             }
-            match tokio::time::timeout(RECHECK, self.rx.recv()).await {
+            let recv = tokio::select! {
+                r = tokio::time::timeout(RECHECK, self.rx.recv()) => r,
+                _ = self.closing.changed() => return None,
+            };
+            match recv {
                 Err(_) => continue, // nur Zugang prüfen; KeepAlive hält die Leitung offen
                 Ok(Ok(c)) => {
                     if c.space != self.space || c.seq <= self.seq {
@@ -294,7 +302,8 @@ pub async fn changes(State(app): State<App>, h: HeaderMap, Path(space): Path<Str
         Ok(v) => v,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let feed = Feed { app, headers: h, space, rx, seq, queue: events.into(), checked: Instant::now() };
+    let closing = app.hub.closing.subscribe();
+    let feed = Feed { app, headers: h, space, rx, seq, queue: events.into(), checked: Instant::now(), closing };
     let stream = futures_util::stream::unfold(feed, |mut f| async move { f.next().await.map(|e| (Ok::<_, Infallible>(e), f)) });
     let mut res = Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(25))).into_response();
     // nginx (Reverse-Proxy) puffert sonst den Strom

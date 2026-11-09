@@ -82,6 +82,8 @@ pub struct Hub {
     inner: Mutex<Inner>,
     /// Gesammelte Änderungen je Takt an die Abonnenten der Lese-API (SSE)
     pub changes_tx: tokio::sync::broadcast::Sender<Arc<SpaceChanges>>,
+    /// true = Server fährt herunter: offene Feeds beenden sich (sonst wartet das geordnete Beenden ewig auf sie)
+    pub closing: tokio::sync::watch::Sender<bool>,
     pub cfg: Config,
     pub metrics: crate::metrics::Metrics,
 }
@@ -98,7 +100,8 @@ pub enum HubError {
 impl Hub {
     pub fn new(store: Store, cfg: Config) -> Arc<Self> {
         let (changes_tx, _) = tokio::sync::broadcast::channel(256);
-        Arc::new(Self { store: Mutex::new(store), inner: Mutex::new(Inner::default()), changes_tx, cfg, metrics: Default::default() })
+        let (closing, _) = tokio::sync::watch::channel(false);
+        Arc::new(Self { store: Mutex::new(store), inner: Mutex::new(Inner::default()), changes_tx, closing, cfg, metrics: Default::default() })
     }
 
     pub fn register(

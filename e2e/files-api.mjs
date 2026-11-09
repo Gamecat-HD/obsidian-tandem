@@ -170,6 +170,12 @@ try {
 	assert.equal((await get("/api/files/anderer")).status, 403);
 	assert.equal((await get("/api/file/test/x.y")).status, 400);
 	c.close();
+	// Offener Feed hält das Beenden nicht auf (geordnetes Herunterfahren wartet sonst ewig auf den Strom)
+	const lingering = await openFeed(`${srv.url}/api/changes/test`, srv.tokens.reader);
+	await lingering.next();
+	const t0 = Date.now();
+	await srv.stop();
+	assert.ok(Date.now() - t0 < 5000, `Beenden dauerte ${Date.now() - t0} ms`);
 	console.log("files-api: alles bestanden");
 } finally {
 	await srv.stop();

@@ -376,14 +376,16 @@ async fn serve(store: db::Store, data: PathBuf, listen: String) -> Result<()> {
     }
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!("tandem-server {} lauscht auf {listen}", env!("CARGO_PKG_VERSION"));
+    let closing = hub.clone();
     axum::serve(listener, server::router(app))
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM");
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {},
                 _ = term.recv() => {},
             }
             info!("wird beendet …");
+            closing.closing.send_replace(true);
         })
         .await?;
     hub.kick_all();
