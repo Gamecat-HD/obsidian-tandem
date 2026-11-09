@@ -36,6 +36,7 @@ Self-hosted LiveSync synchronisiert Dateien über CouchDB. Das funktioniert, abe
 | 🗂️ **Vault-Sync** | alle Dateien, offline-fähig, 3-Wege-Merge bei Änderungen von außen (git, Skripte, KI-Werkzeuge) |
 | 📎 **Anhänge** | nach Hash dedupliziert, gestreamt (auch PDFs mit über 50 MB), Konfliktkopien statt Datenverlust |
 | 🖊️ **[Ink Blocks](https://github.com/Gamecat-HD/obsidian-ink-blocks)** | Handschrift-Striche erscheinen **live während des Schreibens** beim anderen |
+| 📊 **[Zellwerk](https://github.com/Gamecat-HD/obsidian-zellwerk)** | Excel-Tabellen (`.xlsx`) **live gemeinsam** bearbeiten: Zellcursor, gleichzeitiges Einfügen von Zeilen, keine Konfliktkopien ([Live-API](docs/LIVE-API.md)) |
 | 📱 **Mobil** | Android und iPad/iPhone. Trennt im Hintergrund, um Akku zu sparen |
 | 🕓 **Verlauf & Sicherungen** | Versionsgeschichte je Notiz, tägliche Server-Sicherung, Vault-Kopie vor dem ersten Abgleich |
 | 🔐 **Rechte** | Besitzer / Schreiben / Nur-Lesen, Einladungscodes, einzeln sperrbare Geräte |

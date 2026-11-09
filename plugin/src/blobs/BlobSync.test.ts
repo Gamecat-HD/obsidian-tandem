@@ -181,3 +181,34 @@ describe("BlobSync: App stirbt mitten in der Übertragung (Android)", () => {
 		expect(blobs.interrupted("a.pdf")).toBe(true);
 	});
 });
+
+describe("BlobSync: gleichzeitige Änderung", () => {
+	beforeEach(() => {
+		requestUrl.mockReset();
+	});
+
+	const remote = new TextEncoder().encode("Fremd").buffer as ArrayBuffer;
+	const mine = new TextEncoder().encode("Meins").buffer as ArrayBuffer;
+
+	it("ohne Partner-Plugin: lokale Fassung wird Konfliktkopie", async () => {
+		const hash = await sha256Hex(remote);
+		requestUrl.mockResolvedValue({ status: 200, arrayBuffer: remote });
+		const { blobs, app, bridge } = setup({ entry: { hash }, localData: mine });
+		await blobs.fetch("a.pdf", hash, "eltern");
+		expect(app.vault.copy).toHaveBeenCalledOnce();
+		expect(bridge.writeBinary).toHaveBeenCalledOnce();
+	});
+
+	it("Partner-Plugin führt die lokale Fassung schon zusammen: keine Konfliktkopie", async () => {
+		const hash = await sha256Hex(remote);
+		const local = await sha256Hex(mine);
+		requestUrl.mockResolvedValue({ status: 200, arrayBuffer: remote });
+		const { blobs, app, bridge } = setup({ entry: { hash }, localData: mine });
+		const seen: string[] = [];
+		blobs.represented = (path, h) => (seen.push(`${path}:${h}`), h === local);
+		await blobs.fetch("a.pdf", hash, "eltern");
+		expect(seen).toEqual([`a.pdf:${local}`]);
+		expect(app.vault.copy).not.toHaveBeenCalled();
+		expect(bridge.writeBinary).toHaveBeenCalledOnce();
+	});
+});

@@ -44,6 +44,8 @@ export interface SpaceSyncOptions {
 	 * erkennt). `restore` holt alle zurück, auf allen Geräten; fehlt bei Nur-Lese-Zugriff.
 	 */
 	onReferencedDelete?(items: ReferencedDelete[], restore: (() => number) | null): void;
+	/** Partner-Plugin (Live-API): lokaler Stand einer Datei steckt im Begleit-Dokument → keine Konfliktkopie. */
+	represented?(path: string, hash: string): boolean;
 }
 
 /** Standard-Ignorierliste (zusätzlich zu den Einstellungen). */
@@ -121,6 +123,7 @@ export class SpaceSync {
 			exclusive: <T,>(path: string, fn: () => Promise<T>) => (this.inkExclusive ? this.inkExclusive(path, fn) : fn()),
 		});
 		this.blobs = new BlobSync(app, this.index, this.bridge, this.o.store, this.o.space, this.o.http, this.o.key ?? null, (t) => this.o.onTransferLost?.(t));
+		this.blobs.represented = (path, hash) => this.o.represented?.(path, hash) ?? false;
 		this.binder = new EditorBinder({
 			app,
 			docs: this.docs,
@@ -417,7 +420,9 @@ export class SpaceSync {
 		if (this.ro || !(f instanceof TFile) || !this.syncable(f.path)) return;
 		const kind = kindForPath(f.path);
 		if (kind === "blob") {
-			if (this.bridge.isOwnWrite(f.path)) return;
+			// Nicht anhand des eigenen Schreib-Markers überspringen: Eine echte Änderung kurz nach einem
+			// Download (z. B. Excel-Datei aus einem anderen Programm) ginge sonst verloren. Der Upload
+			// vergleicht den Hash mit dem Index und tut bei der eigenen Fassung nichts.
 			return this.track(() => this.blobs.upload(f));
 		}
 		const id = this.index.idForPath(f.path);

@@ -29,6 +29,8 @@ export class BlobSync {
 	private loaded: Promise<void>;
 	private saveTimer: number | null = null;
 	readonly guard: TransferGuard;
+	/** Partner-Plugin führt diese Fassung bereits zusammen (Live-API) → bei Gleichzeitigkeit keine Konfliktkopie. */
+	represented: ((path: string, hash: string) => boolean) | null = null;
 
 	constructor(
 		readonly app: App,
@@ -235,7 +237,7 @@ export class BlobSync {
 			}
 			const known = this.known.get(path);
 			const concurrent = !repair && (parent !== undefined ? local !== parent : !!known && known !== local);
-			if (concurrent) {
+			if (concurrent && !this.represented?.(path, local)) {
 				// Lokal geändert UND remote geändert → lokale Fassung als Konfliktkopie behalten.
 				const dot = path.lastIndexOf(".");
 				const copy = `${path.slice(0, dot)} (Konflikt ${new Date().toISOString().slice(0, 10)})${path.slice(dot)}`;
@@ -268,6 +270,11 @@ export class BlobSync {
 		const known = this.known.get(file.path);
 		if (!known) return true;
 		return (await sha256Hex(await this.app.vault.readBinary(file))) !== known;
+	}
+
+	/** Hash, den die Datei zuletzt hatte, als sie mit dem Index übereinstimmte. */
+	knownHash(path: string): string | undefined {
+		return this.known.get(path);
 	}
 
 	forget(path: string) {
