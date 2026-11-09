@@ -152,7 +152,7 @@ export class DiskBridge {
 				if (final === null) return;
 				l.setBase(final);
 				if (entry.kind === "ink" && current !== final) this.hooks.onInkWritten?.(entry.path);
-			});
+			}, undefined, { reconciles: true });
 		});
 	}
 

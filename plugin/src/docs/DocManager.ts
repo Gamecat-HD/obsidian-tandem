@@ -17,6 +17,10 @@ interface Live {
 	persistTimer: number | null;
 	releaseTimer: number | null;
 	loaded: Promise<void>;
+	/** Stand aus IndexedDB wird gerade eingespielt (ist schon gespeichert). */
+	loading: boolean;
+	/** Laufende `withDoc`-Abgleiche vor ihrem Arbeitsschritt: Sie übernehmen fremde Änderungen ohnehin. */
+	quiet: number;
 }
 
 const PERSIST_DELAY = 400;
@@ -49,7 +53,7 @@ export class DocManager {
 	}
 
 	/** Doc holen (Referenz +1). `awareness` nur für Live-Ansichten. */
-	async acquire(docId: string, opts: { awareness?: boolean } = {}): Promise<DocSession> {
+	async acquire(docId: string, opts: { awareness?: boolean; quiet?: boolean } = {}): Promise<DocSession> {
 		let l = this.live.get(docId);
 		if (l && opts.awareness && !l.session.awareness) {
 			// Upgrade auf Live-Ansicht: Session mit Awareness neu aufbauen (selbes Y.Doc).
@@ -64,23 +68,37 @@ export class DocManager {
 		if (!l) {
 			const doc = new Y.Doc();
 			const session = this.newSession(docId, doc, opts);
-			const entry: Live = { session, refs: 0, persistTimer: null, releaseTimer: null, loaded: Promise.resolve() };
+			const entry: Live = { session, refs: 0, persistTimer: null, releaseTimer: null, loaded: Promise.resolve(), loading: false, quiet: 0 };
 			entry.loaded = this.store.get(docName(this.space, docId)).then((rec) => {
-				if (rec?.state?.length) Y.applyUpdate(doc, rec.state, REMOTE);
+				if (rec?.state?.length) {
+					entry.loading = true;
+					try {
+						Y.applyUpdate(doc, rec.state, REMOTE);
+					} finally {
+						entry.loading = false;
+					}
+				}
 				entry.base = rec?.base;
 				entry.edited = rec?.edited;
 				// Verschlüsselt: erst jetzt abonnieren – ab der gespeicherten Log-Position, mit den offenen Updates.
 				entry.session.start(rec?.e2ee);
 			});
 			doc.on("update", (_u: Uint8Array, origin: unknown) => {
-				if (origin === REMOTE) this.onRemoteUpdate?.(docId);
-				else entry.edited = Date.now();
+				if (entry.loading) {
+					// Gespeicherter Stand: nichts neu zu speichern. Die Datei abgleichen lassen, außer ein Abgleich lädt gerade.
+					if (entry.quiet === 0) this.onRemoteUpdate?.(docId);
+					return;
+				}
+				if (origin === REMOTE) {
+					if (entry.quiet === 0) this.onRemoteUpdate?.(docId);
+				} else entry.edited = Date.now();
 				this.schedulePersist(docId);
 			});
 			this.hookDirty(docId, session);
 			this.live.set(docId, (l = entry));
 		}
 		l.refs++;
+		if (opts.quiet) l.quiet++;
 		if (l.releaseTimer !== null) window.clearTimeout(l.releaseTimer);
 		l.releaseTimer = null;
 		await l.loaded;
@@ -120,12 +138,34 @@ export class DocManager {
 		else l.releaseTimer = window.setTimeout(drop, RELEASE_DELAY);
 	}
 
-	/** Kurzzeitig laden, synchronisieren (falls online) und `fn` ausführen. */
-	async withDoc<T>(docId: string, fn: (s: DocSession, l: { base?: string; setBase(b: string): void }) => T | Promise<T>, syncTimeout = 4000): Promise<T> {
-		const s = await this.acquire(docId);
+	/**
+	 * Kurzzeitig laden, synchronisieren (falls online) und `fn` ausführen.
+	 * `reconciles`: `fn` gleicht selbst Datei und Doc ab. Bis `fn` startet, lösen fremde Änderungen (und der lokale
+	 * Stand beim Laden) dann keinen weiteren Abgleich über `onRemoteUpdate` aus – `fn` sieht sie ohnehin. Sonst
+	 * stieße jeder Abgleich gleich den nächsten an.
+	 */
+	async withDoc<T>(
+		docId: string,
+		fn: (s: DocSession, l: { base?: string; setBase(b: string): void }) => T | Promise<T>,
+		syncTimeout = 4000,
+		opts: { reconciles?: boolean } = {},
+	): Promise<T> {
+		const quiet = !!opts.reconciles;
+		let s: DocSession;
 		try {
-			if (this.conn.status === "online") await s.whenSynced(syncTimeout);
-			const l = this.live.get(docId)!;
+			s = await this.acquire(docId, { quiet });
+		} catch (e) {
+			const l = this.live.get(docId);
+			if (l && quiet) l.quiet--;
+			throw e;
+		}
+		const l = this.live.get(docId)!;
+		try {
+			try {
+				if (this.conn.status === "online") await s.whenSynced(syncTimeout);
+			} finally {
+				if (quiet) l.quiet--;
+			}
 			return await fn(s, {
 				base: l.base,
 				setBase: (b) => {
