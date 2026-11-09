@@ -4,10 +4,11 @@
  */
 import * as Y from "yjs";
 import type { Connection } from "../net/Connection";
-import { docName } from "../net/protocol";
+import { docName, INDEX_DOC } from "../net/protocol";
 import { DocSession, REMOTE } from "./DocSession";
 import type { LocalStore } from "./LocalStore";
 import type { SpaceKey } from "../crypto/e2ee";
+import { trackAuthorship, type Author, type TrackOptions } from "../blame/authorship";
 
 interface Live {
 	session: DocSession;
@@ -29,6 +30,9 @@ export class DocManager {
 	private dirty = new Set<string>();
 	private dirtyLoaded: Promise<void>;
 	private destroyed = false;
+
+	/** Gesetzt: lokale Änderungen mit Person und Zeit versehen (Blame, siehe blame/authorship.ts). */
+	authorship: (TrackOptions & { who: () => Author | null }) | null = null;
 
 	/** Entschlüsseln schlug fehl (einmal pro Ursache melden). */
 	onDecryptError: ((docId: string, e: Error) => void) | null = null;
@@ -72,6 +76,8 @@ export class DocManager {
 				// Verschlüsselt: erst jetzt abonnieren – ab der gespeicherten Log-Position, mit den offenen Updates.
 				entry.session.start(rec?.e2ee);
 			});
+			const a = this.authorship;
+			if (a && docId !== INDEX_DOC) trackAuthorship(doc, a.who, { ...a, ignore: [REMOTE, ...(a.ignore ?? [])] });
 			doc.on("update", (_u: Uint8Array, origin: unknown) => {
 				if (origin === REMOTE) this.onRemoteUpdate?.(docId);
 				else entry.edited = Date.now();

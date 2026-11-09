@@ -13,6 +13,8 @@ export interface TandemSettings {
 	ignore: string;
 	/** Vor dem ersten Abgleich eine Kopie des Vaults anlegen (Desktop). */
 	backupBeforeFirstSync: boolean;
+	/** Blame-Spalte im Editor: wer hat welche Zeile zuletzt geändert. */
+	blame: boolean;
 }
 
 /** „ (57,7 MB)“; leer, wenn die Größe unbekannt ist. */
@@ -27,6 +29,7 @@ export const DEFAULT_SETTINGS: TandemSettings = {
 	displayName: "",
 	ignore: "",
 	backupBeforeFirstSync: true,
+	blame: false,
 };
 
 export class TandemSettingTab extends PluginSettingTab {
@@ -136,6 +139,11 @@ export class TandemSettingTab extends PluginSettingTab {
 					await p.saveSettings();
 				}),
 			);
+
+		new Setting(containerEl)
+			.setName("Wer hat was geschrieben? (Blame)")
+			.setDesc("Zeigt links neben jeder Zeile, wer sie zuletzt geändert hat und wann – wie „git blame“. Auch per Befehl „Tandem: Blame ein/aus“.")
+			.addToggle((t) => t.setValue(p.settings.blame).onChange((v) => void p.setBlame(v)));
 
 		new Setting(containerEl).setName("Neu verbinden").addButton((b) => b.setButtonText("Jetzt").onClick(() => void p.restart()));
 

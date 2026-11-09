@@ -1,4 +1,5 @@
 import { MarkdownView, Notice, Platform, Plugin, requestUrl, SuggestModal, type App } from "obsidian";
+import type { Extension } from "@codemirror/state";
 import * as Y from "yjs";
 import { Connection, type ConnStatus } from "./net/Connection";
 import { LocalStore } from "./docs/LocalStore";
@@ -15,6 +16,8 @@ import type { E2eeParams, WelcomeSpace } from "./net/protocol";
 import { PassphraseModal } from "./ui/Passphrase";
 import { checkTransport } from "./net/transport";
 import { installRelease, latestRelease, newer, reloadPlugin, type Release } from "./ui/Update";
+import { blameExtension } from "./blame/gutter";
+import { AuthorLookup, blameLines, textRuns, type Author } from "./blame/authorship";
 
 const LS_TOKEN = "tandem-token";
 const LS_DEVICE = "tandem-device";
@@ -23,6 +26,8 @@ const LS_E2EE_MODE = "tandem-e2ee-mode:";
 /** Pro Space: abgeleiteter Schlüssel `{check, raw}` – nur auf diesem Gerät. */
 const LS_E2EE_KEY = "tandem-e2ee-key:";
 const LS_UPDATE_CHECK = "tandem-update-check";
+/** Zuletzt vom Server gemeldete Person – damit offline Geschriebenes trotzdem einen Namen bekommt (Blame). */
+const LS_USER = "tandem-user";
 
 export type E2eeMode = "plain" | "pending" | E2eeParams;
 
@@ -34,6 +39,8 @@ export default class TandemPlugin extends Plugin {
 	ink: InkBridge | null = null;
 	store: LocalStore | null = null;
 	private statusEl!: HTMLElement;
+	/** Per registerEditorExtension eingehängt; Inhalt wird beim Umschalten getauscht. */
+	private blameExt: Extension[] = [];
 	private following: number | null = null;
 	private stopFollow: (() => void) | null = null;
 	private hiddenTimer: number | null = null;
@@ -72,6 +79,8 @@ export default class TandemPlugin extends Plugin {
 	async onload() {
 		this.settings = { ...DEFAULT_SETTINGS, ...((await this.loadData()) as Partial<TandemSettings>) };
 		this.registerEditorExtension(collabBaseExtension());
+		this.registerEditorExtension(this.blameExt);
+		if (this.settings.blame) this.blameExt.push(blameExtension({ me: () => this.authorInfo() }));
 		this.addSettingTab(new TandemSettingTab(this.app, this));
 		this.statusEl = this.addStatusBarItem();
 		this.statusEl.addClass("tandem-status");
@@ -91,6 +100,7 @@ export default class TandemPlugin extends Plugin {
 			e2eeUnlock: (passphrase: string) => this.unlockWith(passphrase),
 			e2eeForget: () => this.forgetKey(),
 			live: this.live.facade(),
+			blame: (path: string) => this.blameFor(path),
 		};
 
 		this.addCommand({ id: "connect", name: "Verbinden / neu verbinden", callback: () => void this.restart() });
@@ -108,6 +118,11 @@ export default class TandemPlugin extends Plugin {
 				if (!checking) new HistoryModal(this.app, this.sync, this.http(), this.settings.space, id, f.path).open();
 				return true;
 			},
+		});
+		this.addCommand({
+			id: "blame",
+			name: "Blame ein/aus (wer hat welche Zeile geschrieben?)",
+			callback: () => void this.setBlame(!this.settings.blame),
 		});
 		this.addCommand({
 			id: "backup",
@@ -200,6 +215,10 @@ export default class TandemPlugin extends Plugin {
 		const conn = new Connection({ url, token: this.token, device: this.device });
 		this.conn = conn;
 		conn.onStatus((s) => this.renderStatus(s));
+		conn.onStatus((s) => {
+			const u = conn.welcome?.user;
+			if (s === "online" && u) this.app.saveLocalStorage(LS_USER, JSON.stringify({ id: u.id, name: u.name, color: u.color }));
+		});
 		// Erst die Anmeldung abwarten: WELCOME sagt, ob der Space Ende-zu-Ende-verschlüsselt ist.
 		conn.start();
 		await new Promise<void>((ok) => {
@@ -310,6 +329,7 @@ export default class TandemPlugin extends Plugin {
 					}
 				}),
 			user,
+			author: () => this.authorInfo(),
 			http: () => this.http(),
 			log: (m) => console.log("[tandem]", m),
 			key: this.key,
@@ -349,6 +369,44 @@ export default class TandemPlugin extends Plugin {
 	/** Angemeldete Person (oder Platzhalter, solange keine Verbindung besteht). */
 	userInfo(): { id: string; name: string; color: string } {
 		return this.conn?.welcome?.user ?? { id: "local", name: this.settings.displayName || "Ich", color: "#888888" };
+	}
+
+	/** Wer gerade schreibt (für Blame): angemeldete Person samt Gerät, offline die zuletzt bekannte; sonst null. */
+	authorInfo(): Author | null {
+		let u: { id: string; name: string; color: string } | null | undefined = this.conn?.welcome?.user;
+		if (!u) {
+			try {
+				u = JSON.parse((this.app.loadLocalStorage(LS_USER) as string | null) ?? "null") as typeof u;
+			} catch {
+				u = null;
+			}
+		}
+		return u?.id ? { id: u.id, name: u.name, color: u.color, device: this.device } : null;
+	}
+
+	async setBlame(on: boolean) {
+		this.settings.blame = on;
+		await this.saveSettings();
+		this.blameExt.length = 0;
+		if (on) this.blameExt.push(blameExtension({ me: () => this.authorInfo() }));
+		this.app.workspace.updateOptions();
+	}
+
+	/** Für Tests/andere Plugins: Blame einer gekoppelten Notiz, pro Zeile. */
+	blameFor(path: string) {
+		const s = this.sync?.binder.sessionFor(path);
+		if (!s) return null;
+		const ytext = s.doc.getText("content");
+		const me = this.authorInfo();
+		const lookup = new AuthorLookup(s.doc, (c) => (c === s.doc.clientID ? (me ?? undefined) : undefined));
+		return blameLines(ytext.toString(), textRuns(ytext), lookup).map((b) => ({
+			line: b.line,
+			name: b.who.author?.name ?? null,
+			device: b.who.author?.device ?? null,
+			ts: b.who.ts,
+			src: b.who.src,
+			others: b.others.map((o) => o.name),
+		}));
 	}
 
 	http() {

@@ -1,5 +1,11 @@
 # Änderungen
 
+## Unveröffentlicht
+
+Nur das Plugin hat sich geändert; der Server muss nicht neu ausgerollt werden.
+
+- **Blame: Wer hat welche Zeile geschrieben?** Wie `git blame`: Eine Spalte links neben dem Text zeigt pro Zeile, wer sie zuletzt geändert hat und wann („Nico · vor 3 Std.“), mit einem Balken in der Farbe der Person. Überfahren zeigt Gerät, genaue Zeit und wer in der Zeile sonst noch etwas geschrieben hat. Ein- und ausschalten über den Befehl „Tandem: Blame ein/aus“ oder in den Einstellungen. Die Angaben stehen im jeweiligen Doc (`tandem:authors`, `tandem:marks`), reisen also mit und sind in verschlüsselten Vaults mit verschlüsselt. Erfasst wird ab dieser Version; älterer Text und Text von Geräten mit älterem Plugin erscheinen als „?“ (wer gerade online ist, wird über die Präsenz trotzdem erkannt). Änderungen an geschlossenen Dateien von außen (Claude Code, git, Ink Blocks) werden als „Datei von außen geändert“ markiert. Ist die Datei gerade offen, lädt Obsidian die Änderung selbst in den Editor, dann zählt sie wie Tippen. Test `m22`.
+
 ## 0.7.0
 
 Nur das Plugin hat sich geändert; der Server muss nicht neu ausgerollt werden (Begleit-Dokumente der Live-API sind normale Docs mit der ID `<docId>-live`).
