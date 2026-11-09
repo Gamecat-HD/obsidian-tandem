@@ -15,8 +15,17 @@ export const MAX_BLOB = 100 * 1024 * 1024;
 export class BlobSync {
 	/** Pfad → Hash, den die Datei zuletzt hatte, als sie mit dem Index übereinstimmte. */
 	private known = new Map<string, string>();
-	/** Uploads, die (z. B. offline) fehlgeschlagen sind – werden beim nächsten Abgleich wiederholt. */
+	/**
+	 * Uploads, die nicht zu Ende kamen (offline, Fehler oder App beendet) – werden beim nächsten Abgleich wiederholt.
+	 * Wird VOR dem Upload gespeichert: Stirbt die App mittendrin, kommt kein `catch` mehr dran.
+	 */
 	pendingUploads = new Set<string>();
+	/**
+	 * Pfad → Hash: Downloads, deren Schreiben auf die Platte begonnen, aber nicht geendet hat. Liegt beim Start noch
+	 * einer da, ist die lokale Datei womöglich halb geschrieben. Sie darf dann nicht als lokale Änderung hochgeladen
+	 * werden (sonst ersetzt das kaputte Bild die gute Fassung auf allen Geräten), sondern wird neu geladen.
+	 */
+	private writing = new Map<string, string>();
 	private loaded: Promise<void>;
 	private saveTimer: number | null = null;
 	readonly guard: TransferGuard;
@@ -41,6 +50,9 @@ export class BlobSync {
 			}),
 			store.getMeta<string[]>(`blobs-pending:${space}`).then((l) => {
 				for (const p of l ?? []) this.pendingUploads.add(p);
+			}),
+			store.getMeta<Record<string, string>>(`blobs-writing:${space}`).then((m) => {
+				for (const [p, h] of Object.entries(m ?? {})) this.writing.set(p, h);
 			}),
 		]).then(() => {});
 	}
@@ -67,7 +79,13 @@ export class BlobSync {
 	renamed(from: string, to: string) {
 		if (this.pendingUploads.delete(from)) {
 			this.pendingUploads.add(to);
-			this.savePending();
+			void this.savePending();
+		}
+		const w = this.writing.get(from);
+		if (w !== undefined) {
+			this.writing.delete(from);
+			this.writing.set(to, w);
+			void this.saveWriting();
 		}
 		const h = this.known.get(from);
 		if (h) {
@@ -79,23 +97,58 @@ export class BlobSync {
 	/** Lokale Datei → Server + Index (falls geändert). Pro Pfad nacheinander mit fetch(). */
 	upload(file: TFile): Promise<void> {
 		return this.bridge.run(`blob:${file.path}`, async () => {
-			try {
-				await this.doUpload(file);
-				if (this.pendingUploads.delete(file.path)) this.savePending();
-			} catch (e) {
+			await this.loaded;
+			if (this.writing.has(file.path)) return this.doRepair(file.path);
+			if (!this.pendingUploads.has(file.path)) {
 				this.pendingUploads.add(file.path);
-				this.savePending();
-				throw e;
+				await this.savePending();
 			}
+			await this.doUpload(file);
+			// Bei einem Fehler bleibt der Pfad offen und wird beim nächsten Abgleich wiederholt.
+			this.pendingUploads.delete(file.path);
+			await this.savePending();
 		});
 	}
 
+	// Reicht ohne `durability: "strict"`: Gegen ein beendetes App-Prozess genügt, dass der Wert committet ist.
 	private savePending() {
-		void this.store.setMeta(`blobs-pending:${this.space}`, [...this.pendingUploads]);
+		return this.store.setMeta(`blobs-pending:${this.space}`, [...this.pendingUploads]);
+	}
+
+	private saveWriting() {
+		return this.store.setMeta(`blobs-writing:${this.space}`, Object.fromEntries(this.writing));
+	}
+
+	/** Wurde das Schreiben dieser Datei durch einen Absturz unterbrochen? (Dann neu laden statt hochladen.) */
+	interrupted(path: string): boolean {
+		return this.writing.has(path);
+	}
+
+	/** Unterbrochenen Download wiederholen: Die lokale Datei wird ohne Konfliktkopie durch die Fassung im Index ersetzt. */
+	repair(path: string): Promise<void> {
+		return this.bridge.run(`blob:${path}`, async () => {
+			await this.loaded;
+			await this.doRepair(path);
+		});
+	}
+
+	private async doRepair(path: string): Promise<void> {
+		const id = this.index.idForPath(path);
+		const entry = id ? this.index.get(id) : undefined;
+		const addr = this.key ? entry?.ehash : entry?.hash;
+		if (!entry?.hash || !addr) {
+			// Nicht (mehr) im Index: nichts, wogegen sich die Datei prüfen ließe.
+			this.writing.delete(path);
+			await this.saveWriting();
+			return;
+		}
+		const t: Transfer = { key: `down:${path}:${entry.hash}`, path, dir: "down", hash: entry.hash, size: entry.size };
+		// Übersprungen (zu groß fürs Gerät): Marke bleiben lassen, damit die halbe Datei nie hochgeladen wird.
+		if (this.guard.isSkipped(t.key)) return;
+		await this.guard.run(t, () => this.receiveFile(path, entry.hash!, undefined, addr, true));
 	}
 
 	private async doUpload(file: TFile): Promise<void> {
-		await this.loaded;
 		if (!this.app.vault.getFileByPath(file.path)) return;
 		if (file.stat.size > MAX_BLOB) {
 			console.warn(`[tandem] ${file.path}: größer als ${MAX_BLOB / 1048576} MiB, wird nicht synchronisiert`);
@@ -160,6 +213,7 @@ export class BlobSync {
 
 	private async doFetch(path: string, hash: string, parent?: string): Promise<void> {
 		await this.loaded;
+		if (this.writing.has(path)) return this.doRepair(path);
 		// Inzwischen von noch neuerer Fassung überholt?
 		const id = this.index.idForPath(path);
 		const entry = id ? this.index.get(id) : undefined;
@@ -171,13 +225,16 @@ export class BlobSync {
 		await this.guard.run(t, () => this.receiveFile(path, hash, parent, addr));
 	}
 
-	private async receiveFile(path: string, hash: string, parent: string | undefined, addr: string): Promise<void> {
+	private async receiveFile(path: string, hash: string, parent: string | undefined, addr: string, repair = false): Promise<void> {
 		const file = this.app.vault.getFileByPath(path);
 		if (file) {
 			const local = await sha256Hex(await this.app.vault.readBinary(file));
-			if (local === hash) return this.remember(path, hash);
+			if (local === hash) {
+				this.remember(path, hash);
+				return this.doneWriting(path);
+			}
 			const known = this.known.get(path);
-			const concurrent = parent !== undefined ? local !== parent : !!known && known !== local;
+			const concurrent = !repair && (parent !== undefined ? local !== parent : !!known && known !== local);
 			if (concurrent) {
 				// Lokal geändert UND remote geändert → lokale Fassung als Konfliktkopie behalten.
 				const dot = path.lastIndexOf(".");
@@ -194,8 +251,15 @@ export class BlobSync {
 		}
 		const got = await sha256Hex(content);
 		if (got !== hash) throw new Error(`Download ${path}: Hash stimmt nicht`);
+		this.writing.set(path, hash);
+		await this.saveWriting();
 		await this.bridge.writeBinary(path, content);
 		this.remember(path, hash);
+		await this.doneWriting(path);
+	}
+
+	private async doneWriting(path: string) {
+		if (this.writing.delete(path)) await this.saveWriting();
 	}
 
 	/** Lokale Datei seit dem letzten Abgleich verändert? */
