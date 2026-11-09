@@ -18,17 +18,17 @@ function memoryStore(meta: Record<string, unknown> = {}) {
 	};
 }
 
-function setup(opts: { entry?: Record<string, unknown>; local?: boolean; meta?: Record<string, unknown>; onLost?: (t: unknown) => void } = {}) {
+function setup(opts: { entry?: Record<string, unknown>; local?: boolean; localData?: ArrayBuffer; meta?: Record<string, unknown>; onLost?: (t: unknown) => void; writeBinary?: () => Promise<void> } = {}) {
 	const index = {
 		idForPath: () => (opts.entry ? "id" : undefined),
 		get: () => opts.entry,
 		update: vi.fn(),
 		add: vi.fn(),
 	};
-	const app = { vault: { getFileByPath: () => (opts.local === false ? null : file), readBinary: async () => data, copy: vi.fn() } };
-	const bridge = { run: (_k: string, fn: () => Promise<void>) => fn(), writeBinary: vi.fn() };
+	const app = { vault: { getFileByPath: () => (opts.local === false ? null : file), readBinary: async () => opts.localData ?? data, copy: vi.fn() } };
+	const bridge = { run: (_k: string, fn: () => Promise<void>) => fn(), writeBinary: vi.fn(opts.writeBinary ?? (async () => {})) };
 	const blobs = new BlobSync(app as never, index as never, bridge as never, memoryStore(opts.meta) as never, "s", () => ({ base: "https://x", token: "t" }), null, opts.onLost as never);
-	return { blobs, index, bridge };
+	return { blobs, index, bridge, app };
 }
 
 const methods = () => requestUrl.mock.calls.map(([r]) => r.method);
@@ -104,5 +104,80 @@ describe("BlobSync: abgestürzte Übertragung", () => {
 		const { blobs, bridge } = setup({ entry: { hash, size: BIG_BLOB }, local: false, meta: { "blobs-skipped:s": [old] } });
 		await blobs.fetch("a.pdf", hash);
 		expect(bridge.writeBinary).toHaveBeenCalledOnce();
+	});
+});
+
+describe("BlobSync: App stirbt mitten in der Übertragung (Android)", () => {
+	beforeEach(() => {
+		requestUrl.mockReset();
+	});
+
+	const never = () => new Promise<never>(() => {});
+
+	it("Upload: Pfad ist schon vorher als offen gespeichert und wird beim nächsten Start wiederholt", async () => {
+		const meta: Record<string, unknown> = {};
+		requestUrl.mockImplementation(async (r: { method: string }) => (r.method === "HEAD" ? { status: 404 } : never()));
+		const { blobs } = setup({ meta });
+		void blobs.upload(file as never);
+		await vi.waitFor(() => expect(methods()).toEqual(["HEAD", "PUT"]));
+		expect(meta["blobs-pending:s"]).toEqual(["a.pdf"]);
+
+		// Neuer Start: wird als offen geladen (der Abgleich lädt dann erneut hoch).
+		const next = setup({ meta }).blobs;
+		await vi.waitFor(() => expect(next.pendingUploads.has("a.pdf")).toBe(true));
+	});
+
+	it("Upload fertig: Pfad ist nicht mehr offen", async () => {
+		const meta: Record<string, unknown> = {};
+		requestUrl.mockResolvedValueOnce({ status: 404 }).mockResolvedValueOnce({ status: 201 });
+		const { blobs } = setup({ meta });
+		await blobs.upload(file as never);
+		expect(meta["blobs-pending:s"]).toEqual([]);
+	});
+
+	it("Download stirbt beim Schreiben: die halbe Datei wird beim nächsten Start neu geladen, nicht hochgeladen", async () => {
+		const hash = await sha256Hex(data);
+		const meta: Record<string, unknown> = {};
+		requestUrl.mockResolvedValue({ status: 200, arrayBuffer: data });
+		const crashed = setup({ entry: { hash, size: data.byteLength }, local: false, meta, writeBinary: never });
+		void crashed.blobs.fetch("a.pdf", hash);
+		await vi.waitFor(() => expect(crashed.bridge.writeBinary).toHaveBeenCalledOnce());
+		expect(meta["blobs-writing:s"]).toEqual({ "a.pdf": hash });
+
+		requestUrl.mockReset();
+		requestUrl.mockResolvedValue({ status: 200, arrayBuffer: data });
+		const half = new TextEncoder().encode("Inh").buffer as ArrayBuffer;
+		const next = setup({ entry: { hash, size: data.byteLength }, localData: half, meta });
+		await next.blobs.upload(file as never);
+		expect(next.blobs.interrupted("a.pdf")).toBe(false);
+		expect(methods()).toEqual(["GET"]);
+		expect(next.bridge.writeBinary).toHaveBeenCalledWith("a.pdf", data);
+		expect(next.index.update).not.toHaveBeenCalled();
+		expect(next.app.vault.copy).not.toHaveBeenCalled();
+		expect(meta["blobs-writing:s"]).toEqual({});
+	});
+
+	it("war das Schreiben doch fertig: nur Marke entfernen", async () => {
+		const hash = await sha256Hex(data);
+		const meta: Record<string, unknown> = { "blobs-writing:s": { "a.pdf": hash } };
+		const { blobs, bridge } = setup({ entry: { hash, size: data.byteLength }, meta });
+		await blobs.repair("a.pdf");
+		expect(requestUrl).not.toHaveBeenCalled();
+		expect(bridge.writeBinary).not.toHaveBeenCalled();
+		expect(meta["blobs-writing:s"]).toEqual({});
+	});
+
+	it("halbe Datei einer übersprungenen großen Fassung wird nie hochgeladen", async () => {
+		const hash = await sha256Hex(data);
+		const meta: Record<string, unknown> = {
+			"blobs-writing:s": { "a.pdf": hash },
+			"blob-transfer:s": { key: `down:a.pdf:${hash}`, path: "a.pdf", dir: "down", hash, size: BIG_BLOB },
+		};
+		const half = new TextEncoder().encode("Inh").buffer as ArrayBuffer;
+		const { blobs, index } = setup({ entry: { hash, size: BIG_BLOB }, localData: half, meta, onLost: () => {} });
+		await blobs.upload(file as never);
+		expect(requestUrl).not.toHaveBeenCalled();
+		expect(index.update).not.toHaveBeenCalled();
+		expect(blobs.interrupted("a.pdf")).toBe(true);
 	});
 });

@@ -1,5 +1,13 @@
 # Änderungen
 
+## Nächste Version
+
+Nur das Plugin hat sich geändert.
+
+- **Bilder gehen beim Absturz nicht mehr mit kaputt:** Kleine Anhänge liefen bisher parallel zu einem großen. Beendete Android die App beim großen Download, starben die Bilder daneben mit, ohne dass Tandem es bemerkte. Jetzt läuft eine große Übertragung wirklich allein: Sie wartet auf laufende kleine, und neue kleine warten auf sie.
+- **Abgebrochene Uploads werden nachgeholt:** Ein Upload wird jetzt vor dem Start als offen gespeichert, nicht erst bei einem Fehler. Stirbt die App mittendrin, lädt der nächste Abgleich die Datei erneut hoch. Vorher konnte ein geändertes Bild so ohne Meldung auf der alten Fassung hängen bleiben.
+- **Halb geschriebene Downloads werden neu geladen:** Stirbt die App beim Schreiben eines Anhangs, galt die halbe Datei beim nächsten Start als lokale Änderung und konnte hochgeladen werden. Dann hätte sie die gute Fassung auf allen Geräten ersetzt. Jetzt merkt sich Tandem, welche Datei gerade geschrieben wird, und lädt sie nach einem Absturz neu, ohne Konfliktkopie.
+
 ## 0.6.3
 
 Nur das Plugin hat sich geändert.

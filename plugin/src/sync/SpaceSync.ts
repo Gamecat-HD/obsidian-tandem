@@ -286,6 +286,11 @@ export class SpaceSync {
 			if (!id) continue;
 			const e = this.index.get(id)!;
 			if (e.kind === "blob") {
+				// Absturz beim Schreiben eines Downloads: Datei womöglich halb → neu laden, nie hochladen.
+				if (this.blobs.interrupted(f.path)) {
+					this.track(() => this.blobs.repair(f.path));
+					continue;
+				}
 				if (ro) continue;
 				if (changed || !e.hash || this.blobs.pendingUploads.has(f.path)) this.track(() => this.blobs.upload(f));
 			} else if (changed || !(await this.hasBase(id))) {

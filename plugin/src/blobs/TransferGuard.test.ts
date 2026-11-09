@@ -60,6 +60,46 @@ describe("TransferGuard", () => {
 		expect(await store.getMeta(MARKER)).toBeNull();
 	});
 
+	it("eine große Datei wartet, bis laufende kleine fertig sind", async () => {
+		const store = await newStore();
+		const guard = new TransferGuard(store, "s");
+		await guard.loaded;
+		const gate = deferred();
+		const log: string[] = [];
+		const s = guard.run(small("bild"), async () => {
+			log.push("bild start");
+			await gate.done;
+			log.push("bild ende");
+		});
+		const b = guard.run(big("pdf"), async () => void log.push("pdf"));
+		await vi.waitFor(() => expect(log).toEqual(["bild start"]));
+		expect(await store.getMeta(MARKER)).toBeUndefined();
+		gate.open();
+		await Promise.all([s, b]);
+		expect(log).toEqual(["bild start", "bild ende", "pdf"]);
+	});
+
+	it("während einer großen Datei warten neue kleine – beim Absturz stirbt nur die große", async () => {
+		const store = await newStore();
+		const guard = new TransferGuard(store, "s");
+		await guard.loaded;
+		const gate = deferred();
+		const log: string[] = [];
+		const b = guard.run(big("pdf"), async () => {
+			log.push("pdf start");
+			await gate.done;
+			log.push("pdf ende");
+		});
+		await vi.waitFor(() => expect(log).toEqual(["pdf start"]));
+		const s1 = guard.run(small("bild1"), async () => void log.push("bild1"));
+		const s2 = guard.run(small("bild2"), async () => void log.push("bild2"));
+		await new Promise((ok) => setTimeout(ok, 20));
+		expect(log).toEqual(["pdf start"]);
+		gate.open();
+		await Promise.all([b, s1, s2]);
+		expect(log).toEqual(["pdf start", "pdf ende", "bild1", "bild2"]);
+	});
+
 	it("ein Fehler löscht die Marke, überspringt nichts und hält die nächste Datei nicht auf", async () => {
 		const store = await newStore();
 		const guard = new TransferGuard(store, "s");
