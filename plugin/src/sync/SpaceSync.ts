@@ -15,6 +15,16 @@ import { EditorBinder } from "../editor/EditorBinder";
 import { BlobSync } from "../blobs/BlobSync";
 import type { SpaceKey } from "../crypto/e2ee";
 import type { Transfer } from "../blobs/TransferGuard";
+import { referencingNotes } from "./references";
+
+/** Ein gelöschter Anhang, auf den Notizen noch verweisen. */
+export interface ReferencedDelete {
+	path: string;
+	/** Wer gelöscht hat (Benutzerkennung); `local`: auf diesem Gerät. */
+	by?: string;
+	local: boolean;
+	notes: string[];
+}
 
 export interface SpaceSyncOptions {
 	app: App;
@@ -29,6 +39,11 @@ export interface SpaceSyncOptions {
 	key?: SpaceKey | null;
 	/** Eine große Übertragung kam beim letzten Lauf nicht zu Ende (App beendet) und wird nun übersprungen. */
 	onTransferLost?(t: Transfer): void;
+	/**
+	 * Anhänge wurden gelöscht, die Notizen noch verwenden (etwa als Ink-Hintergrund, den Obsidian nicht als Link
+	 * erkennt). `restore` holt alle zurück, auf allen Geräten; fehlt bei Nur-Lese-Zugriff.
+	 */
+	onReferencedDelete?(items: ReferencedDelete[], restore: (() => number) | null): void;
 }
 
 /** Standard-Ignorierliste (zusätzlich zu den Einstellungen). */
@@ -78,6 +93,9 @@ export class SpaceSync {
 	/** Für Tests/Statusanzeige: laufende Hintergrundarbeit. */
 	pending = 0;
 	private idleWaiters: (() => void)[] = [];
+	/** Gelöschte Anhänge (docId → Angaben), gesammelt und kurz danach auf Verweise geprüft. */
+	private deleted = new Map<string, { path: string; by?: string; local: boolean }>();
+	private deletedTimer: number | null = null;
 
 	constructor(readonly o: SpaceSyncOptions) {
 		this.docs = new DocManager(o.conn, o.store, o.space, o.key ?? null);
@@ -347,6 +365,7 @@ export class SpaceSync {
 				if (prev && !prev.del) {
 					await this.bridge.trash(prev.path);
 					this.blobs.forget(prev.path);
+					this.noteDeleted(id, prev.path, entry.by, false);
 				}
 				return;
 			}
@@ -420,7 +439,9 @@ export class SpaceSync {
 	private onDelete(f: TAbstractFile) {
 		if (this.ro) return;
 		if (!this.syncable(f.path) || this.bridge.isOwnDelete(f.path)) return;
+		const id = f instanceof TFile ? this.index.idForPath(f.path) : undefined;
 		this.index.remove(f.path);
+		if (id && this.index.get(id)?.kind === "blob") this.noteDeleted(id, f.path, undefined, true);
 		if (f instanceof TFile) this.blobs.forget(f.path);
 		this.binder.refresh();
 	}
@@ -442,8 +463,62 @@ export class SpaceSync {
 		this.binder.renamed(old, f.path);
 	}
 
+	/**
+	 * Gelöschten Anhang vormerken. Geprüft wird erst nach einer kurzen Pause: Beim Löschen eines ganzen Ordners
+	 * verschwinden die Notizen kurz nach den Bildern, und mehrere Löschungen ergeben nur einen Hinweis.
+	 */
+	private noteDeleted(id: string, path: string, by: string | undefined, local: boolean) {
+		if (!this.o.onReferencedDelete) return;
+		this.deleted.set(id, { path, by, local });
+		if (this.deletedTimer !== null) window.clearTimeout(this.deletedTimer);
+		this.deletedTimer = window.setTimeout(() => {
+			this.deletedTimer = null;
+			void this.checkDeleted().catch((e) => console.warn("[tandem] Verweise prüfen", e));
+		}, 2000);
+	}
+
+	private async checkDeleted() {
+		const batch = [...this.deleted];
+		this.deleted.clear();
+		const { app } = this.o;
+		const notes = app.vault
+			.getMarkdownFiles()
+			.filter((f) => this.syncable(f.path))
+			.map((f) => ({ path: f.path, read: () => app.vault.cachedRead(f) }));
+		const stillResolves = (name: string, from: string) => !!app.metadataCache.getFirstLinkpathDest(name, from);
+		const items: (ReferencedDelete & { id: string })[] = [];
+		for (const [id, d] of batch) {
+			const e = this.index.get(id);
+			// Inzwischen wiederhergestellt oder ohne Inhalt auf dem Server: nichts zu melden.
+			if (!e?.del || !e.hash || app.vault.getAbstractFileByPath(d.path)) continue;
+			const refs = await referencingNotes(d.path, notes, stillResolves);
+			if (refs.length) items.push({ id, ...d, notes: refs });
+		}
+		if (!items.length) return;
+		for (const i of items) this.log(`${i.path}: gelöscht${i.local ? "" : ` von ${i.by ?? "?"}`}, wird aber noch verwendet in ${i.notes.join(", ")}`);
+		const restore = this.ro ? null : () => items.filter((i) => this.restoreBlob(i.id)).length;
+		this.o.onReferencedDelete?.(
+			items.map(({ id: _id, ...rest }) => rest),
+			restore,
+		);
+	}
+
+	/** Gelöschten Anhang zurückholen (Index-Eintrag wieder lebendig → alle Geräte laden ihn). */
+	restoreBlob(id: string): boolean {
+		const e = this.index.get(id);
+		if (!e?.del || !e.hash || this.index.idForPath(e.path)) return false;
+		this.index.update(id, { del: false });
+		const hash = e.hash;
+		this.track(() => this.blobs.fetch(e.path, hash));
+		this.log(`${e.path}: wiederhergestellt`);
+		return true;
+	}
+
 	async stop() {
 		this.started = false;
+		if (this.deletedTimer !== null) window.clearTimeout(this.deletedTimer);
+		this.deletedTimer = null;
+		this.deleted.clear();
 		for (const t of this.remoteTimers.values()) window.clearTimeout(t);
 		this.remoteTimers.clear();
 		for (const r of this.refs) this.o.app.vault.offref(r);
