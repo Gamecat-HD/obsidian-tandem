@@ -1,6 +1,6 @@
 # Änderungen
 
-## Nächste Version
+## 0.7.0
 
 Nur das Plugin hat sich geändert; der Server muss nicht neu ausgerollt werden (Begleit-Dokumente der Live-API sind normale Docs mit der ID `<docId>-live`).
 
