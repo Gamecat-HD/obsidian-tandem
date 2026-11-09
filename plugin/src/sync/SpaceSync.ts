@@ -407,8 +407,11 @@ export class SpaceSync {
 			let p: string;
 			do p = `${oldPath.slice(0, dot)} (${n++})${oldPath.slice(dot)}`;
 			while (this.index.idForPath(p) || this.o.app.vault.getAbstractFileByPath(p));
-			this.index.update(id, { path: p });
-			if (this.o.app.vault.getFileByPath(oldPath)) await this.bridge.rename(oldPath, p);
+			// Bis die Datei umbenannt ist, liegt am alten Pfad noch der Inhalt des Verlierers → dort nicht abgleichen
+			await this.bridge.holdWhile(oldPath, async () => {
+				this.index.update(id, { path: p });
+				if (this.o.app.vault.getFileByPath(oldPath)) await this.bridge.rename(oldPath, p);
+			});
 			this.log(`Namenskonflikt: ${oldPath} → ${p}`);
 			const winner = this.index.idForPath(oldPath);
 			if (winner) {

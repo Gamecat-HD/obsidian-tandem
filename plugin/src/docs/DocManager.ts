@@ -4,7 +4,7 @@
  */
 import * as Y from "yjs";
 import type { Connection } from "../net/Connection";
-import { docName } from "../net/protocol";
+import { docName, INDEX_DOC } from "../net/protocol";
 import { DocSession, REMOTE } from "./DocSession";
 import type { LocalStore } from "./LocalStore";
 import type { SpaceKey } from "../crypto/e2ee";
@@ -224,7 +224,10 @@ export class DocManager {
 		if (this.destroyed) return;
 		const l = this.live.get(docId);
 		if (!l || l.persistTimer !== null) return;
-		const delay = Math.min(PERSIST_MAX_DELAY, Math.max(PERSIST_DELAY, l.encodeMs * PERSIST_COST_FACTOR));
+		// Der Index bleibt immer geladen und wird nur per Zeitgeber gesichert: kurz halten, sonst kann ein
+		// Absturz offline gelöschte/umbenannte Dateien zurückbringen bzw. doppeln.
+		const delay =
+			docId === INDEX_DOC ? PERSIST_DELAY : Math.min(PERSIST_MAX_DELAY, Math.max(PERSIST_DELAY, l.encodeMs * PERSIST_COST_FACTOR));
 		l.persistTimer = window.setTimeout(() => void this.persistNow(docId, l), delay);
 	}
 

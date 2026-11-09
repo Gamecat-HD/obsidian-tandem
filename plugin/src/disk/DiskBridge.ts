@@ -91,13 +91,27 @@ export class DiskBridge {
 		return this.check(`d:${path}`, undefined, true);
 	}
 
+	/**
+	 * Pfade, deren Datei gerade einem anderen Eintrag gehört und weggeräumt wird (Namenskonflikt: Index
+	 * zeigt schon auf den Gewinner, die Datei ist aber noch die des Verlierers). Abgleiche dort warten.
+	 */
+	private held = new Set<string>();
+	async holdWhile<T>(path: string, fn: () => Promise<T>): Promise<T> {
+		this.held.add(path);
+		try {
+			return await fn();
+		} finally {
+			this.held.delete(path);
+		}
+	}
+
 	/** Datei ⇄ Doc abgleichen (md/ink). */
 	reconcile(docId: string): Promise<void> {
 		return this.run(docId, async () => {
 			const entry = this.index.get(docId);
 			if (!entry || entry.del || entry.kind === "blob") return;
 			// Namenskonflikt noch offen: Die Datei am Pfad gehört evtl. dem anderen Eintrag → erst auflösen lassen.
-			if (this.index.contested(entry.path)) return;
+			if (this.index.contested(entry.path) || this.held.has(entry.path)) return;
 			const file = this.app.vault.getFileByPath(entry.path);
 			// Offene Notiz: der Editor synchronisiert selbst (außer die Datei fehlt – dann neu anlegen).
 			if (file && this.hooks.isBound(entry.path)) return;
@@ -140,6 +154,8 @@ export class DiskBridge {
 				let current: string | null = null;
 				const rmw = () =>
 					this.app.vault.process(f, (data) => {
+						// Datei inzwischen umbenannt bzw. wird gerade weggeräumt: nicht fremden Inhalt zusammenführen
+						if (f.path !== entry.path || this.held.has(entry.path)) return data;
 						current = data;
 						final = merge(data);
 						if (final === null || final === data) return data;
