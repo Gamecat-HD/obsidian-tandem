@@ -57,6 +57,7 @@ pub fn router(app: App) -> Router {
         .route("/api/status", get(status))
         .route("/api/files/{space}", get(crate::files_api::files))
         .route("/api/file/{space}/{doc}", get(crate::files_api::file))
+        .route("/api/changes/{space}", get(crate::files_api::changes))
         .layer(DefaultBodyLimit::max(MAX_BLOB))
         .with_state(app)
 }

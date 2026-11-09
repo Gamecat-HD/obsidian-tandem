@@ -116,7 +116,7 @@ Messaufbau, alle Werte und wie man sie selbst nachmisst: **[docs/PERFORMANCE.md]
 └──────────────────────────────┘                  └──────────────────────────────┘
 ```
 
-Jede Notiz ist ein eigenes Yjs-Dokument, der Dateibaum ein weiteres. Änderungen von außen (z. B. `git pull`) erkennt das Plugin per Diff und spielt sie als CRDT-Update ein. Hintergründe: [Plan](docs/PLAN.md), [Protokoll](docs/PROTOKOLL.md), [Architekturentscheidungen](docs/adr/).
+Jede Notiz ist ein eigenes Yjs-Dokument, der Dateibaum ein weiteres. Änderungen von außen (z. B. `git pull`) erkennt das Plugin per Diff und spielt sie als CRDT-Update ein. Hintergründe: [Plan](docs/PLAN.md), [Protokoll](docs/PROTOKOLL.md), [Architekturentscheidungen](docs/adr/). Andere Dienste (z. B. eine Lernplattform) lesen einen Vault über die stabile [Lese-API](docs/LESE-API.md) mit Änderungs-Feed.
 
 ## Entwickeln
 

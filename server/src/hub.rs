@@ -69,9 +69,21 @@ struct Inner {
     next_id: ConnId,
 }
 
+/// Änderungsmeldung für Leser ohne WebSocket (Lese-API, `GET /api/changes/<space>`): Space, Sequenz, Docs.
+#[derive(Debug)]
+pub struct SpaceChanges {
+    pub space: String,
+    pub seq: u64,
+    pub docs: Vec<String>,
+}
+
 pub struct Hub {
     pub store: Mutex<Store>,
     inner: Mutex<Inner>,
+    /// Gesammelte Änderungen je Takt an die Abonnenten der Lese-API (SSE)
+    pub changes_tx: tokio::sync::broadcast::Sender<Arc<SpaceChanges>>,
+    /// true = Server fährt herunter: offene Feeds beenden sich (sonst wartet das geordnete Beenden ewig auf sie)
+    pub closing: tokio::sync::watch::Sender<bool>,
     pub cfg: Config,
     pub metrics: crate::metrics::Metrics,
 }
@@ -87,7 +99,9 @@ pub enum HubError {
 
 impl Hub {
     pub fn new(store: Store, cfg: Config) -> Arc<Self> {
-        Arc::new(Self { store: Mutex::new(store), inner: Mutex::new(Inner::default()), cfg, metrics: Default::default() })
+        let (changes_tx, _) = tokio::sync::broadcast::channel(256);
+        let (closing, _) = tokio::sync::watch::channel(false);
+        Arc::new(Self { store: Mutex::new(store), inner: Mutex::new(Inner::default()), changes_tx, closing, cfg, metrics: Default::default() })
     }
 
     pub fn register(
@@ -505,6 +519,12 @@ impl Hub {
         }
         let pending = std::mem::take(&mut g.pending);
         for (space, (seq, docs)) in pending {
+            // Lese-API (SSE): nur senden, wenn jemand zuhört
+            if self.changes_tx.receiver_count() > 0 {
+                let mut list: Vec<String> = docs.iter().cloned().collect();
+                list.sort();
+                let _ = self.changes_tx.send(Arc::new(SpaceChanges { space: space.clone(), seq, docs: list }));
+            }
             for (id, c) in &g.conns {
                 if !c.spaces.contains_key(&space) {
                     continue;

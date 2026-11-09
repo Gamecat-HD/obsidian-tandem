@@ -3,6 +3,8 @@
 Eine WebSocket-Verbindung pro Gerät (`wss://<host>/ws`) mit binären Frames. Die Kodierung verwendet `lib0/encoding`, also dieselbe wie Yjs:
 `varUint` = LEB128 ohne Vorzeichen, `varString` = varUint-Länge + UTF-8, `varBytes` = varUint-Länge + Bytes.
 
+Das Protokoll gehört dem Obsidian-Plugin und darf sich mit jeder Version ändern. Fremde Dienste nutzen stattdessen die stabile [Lese-API](LESE-API.md) (HTTP + Änderungs-Feed).
+
 Jeder Frame beginnt mit `varUint type`.
 
 | type | Name | Richtung | Felder |

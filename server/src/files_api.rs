@@ -5,6 +5,14 @@
 //! |---|---|---|
 //! | GET | `/api/files/<space>` | `{ files: [{ id, path, kind, size, ts, rev }] }` – nur lebende Einträge, je Pfad einer |
 //! | GET | `/api/file/<space>/<docId>` | Inhalt als Bytes (md: Text, ink: `.ink`-Datei, blob: Anhang), Header `X-Tandem-Rev` |
+//! | GET | `/api/changes/<space>?since=<seq>` | Änderungs-Feed (Server-Sent Events), siehe unten |
+//!
+//! Diese Routen sind die offizielle Schnittstelle für fremde Dienste („Lese-API v1“, `docs/LESE-API.md`). Sie
+//! hängen nicht an der Plugin-Version und ändern sich nur abwärtskompatibel (neue Felder, neue Ereignisse).
+//!
+//! Änderungs-Feed: Erst ein Ereignis `changes` mit allen Docs, die seit `since` geändert wurden (`catchup: true`),
+//! danach laufend je Takt (300 ms) ein `changes` mit den neu geänderten Docs. Die Ereignis-ID ist die Sequenz des
+//! Space – wer sie sich merkt, setzt nach einer Unterbrechung mit `?since=` (oder `Last-Event-ID`) dort an.
 //!
 //! `rev` ändert sich mit jeder Änderung: Änderungszähler (`docs.seq`) bei md/ink, Hash bei Anhängen. Wer liest,
 //! vergleicht `X-Tandem-Rev` mit dem Index – weicht er ab, wurde die Datei zwischendurch geändert.
@@ -14,11 +22,14 @@ use crate::codec;
 use crate::server::{App, open_blob, require_role};
 use crate::vault::{self, Entry};
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
+use std::time::{Duration, Instant};
 use yrs::{Any, Array, Doc, Map, Out, ReadTxn, Transact};
 
 #[derive(Serialize)]
@@ -175,6 +186,129 @@ pub async fn file(State(app): State<App>, h: HeaderMap, Path((space, id)): Path<
     if let Ok(v) = HeaderValue::from_str(&rev) {
         res.headers_mut().insert("x-tandem-rev", v);
     }
+    res
+}
+
+// ── Änderungs-Feed (SSE) ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ChangesQuery {
+    since: Option<u64>,
+}
+
+/// So oft wird geprüft, ob der Token noch gilt (gesperrt, Space entzogen) – dann endet der Feed.
+const RECHECK: Duration = Duration::from_secs(60);
+/// Portionsgröße beim Nachholen (wie CATCHUP im WebSocket-Protokoll)
+const CATCHUP_CHUNK: usize = 500;
+
+/// Doc-Name `space/docId` → `docId` (die IDs aus `/api/files`; `_index` = Dateiliste geändert)
+fn doc_ids(space: &str, docs: &[String]) -> Vec<String> {
+    let prefix = format!("{space}/");
+    docs.iter().map(|d| d.strip_prefix(&prefix).unwrap_or(d).to_string()).collect()
+}
+
+fn changes_event(seq: u64, docs: &[String], catchup: bool) -> Event {
+    let mut v = serde_json::json!({ "seq": seq, "docs": docs });
+    if catchup {
+        v["catchup"] = serde_json::Value::Bool(true);
+    }
+    Event::default().event("changes").id(seq.to_string()).data(v.to_string())
+}
+
+/// Nachholen seit `since`: Ereignisse (in Portionen) und die aktuelle Sequenz.
+fn catchup(app: &App, space: &str, since: u64) -> Result<(u64, Vec<Event>), String> {
+    let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
+    let seq = st.space_seq(space).map_err(|e| e.to_string())?;
+    // Leser ist „aus der Zukunft“ (Server-DB zurückgesetzt) → alles melden
+    let since = if since > seq { 0 } else { since };
+    let docs = doc_ids(space, &st.changed_since(space, since).map_err(|e| e.to_string())?);
+    drop(st);
+    let mut events: Vec<Event> = docs.chunks(CATCHUP_CHUNK).map(|c| changes_event(seq, c, true)).collect();
+    if events.is_empty() {
+        events.push(changes_event(seq, &[], true));
+    }
+    Ok((seq, events))
+}
+
+struct Feed {
+    app: App,
+    headers: HeaderMap,
+    space: String,
+    rx: tokio::sync::broadcast::Receiver<std::sync::Arc<crate::hub::SpaceChanges>>,
+    seq: u64,
+    queue: std::collections::VecDeque<Event>,
+    checked: Instant,
+    closing: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Feed {
+    /// Nächstes Ereignis; None beendet den Feed (Zugang entzogen, Server fährt herunter).
+    async fn next(&mut self) -> Option<Event> {
+        loop {
+            if *self.closing.borrow() {
+                return None;
+            }
+            if let Some(e) = self.queue.pop_front() {
+                return Some(e);
+            }
+            if self.checked.elapsed() >= RECHECK {
+                if require_role(&self.app, &self.headers, &self.space, false).is_err() {
+                    return None;
+                }
+                self.checked = Instant::now();
+            }
+            let recv = tokio::select! {
+                r = tokio::time::timeout(RECHECK, self.rx.recv()) => r,
+                _ = self.closing.changed() => return None,
+            };
+            match recv {
+                Err(_) => continue, // nur Zugang prüfen; KeepAlive hält die Leitung offen
+                Ok(Ok(c)) => {
+                    if c.space != self.space || c.seq <= self.seq {
+                        continue;
+                    }
+                    self.seq = c.seq;
+                    return Some(changes_event(c.seq, &doc_ids(&self.space, &c.docs), false));
+                }
+                // Zu langsam gelesen → aus der Datenbank nachholen, was fehlt
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => match catchup(&self.app, &self.space, self.seq) {
+                    Ok((seq, events)) => {
+                        self.seq = seq;
+                        self.queue.extend(events);
+                    }
+                    Err(_) => return None,
+                },
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
+            }
+        }
+    }
+}
+
+pub async fn changes(State(app): State<App>, h: HeaderMap, Path(space): Path<String>, Query(q): Query<ChangesQuery>) -> Response {
+    if !codec::valid_id(&space) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Err(c) = require_role(&app, &h, &space, false) {
+        return c.into_response();
+    }
+    let e2ee = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).space_e2ee(&space);
+    if matches!(e2ee, Ok(Some(_))) {
+        return (StatusCode::CONFLICT, "Vault ist Ende-zu-Ende-verschlüsselt").into_response();
+    }
+    let since = q.since.or_else(|| h.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok())).unwrap_or(0);
+    // Erst abonnieren, dann nachholen: nichts geht zwischen den beiden verloren (Doppeltes filtert die Sequenz)
+    let rx = app.hub.changes_tx.subscribe();
+    let (seq, events) = match catchup(&app, &space, since) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let closing = app.hub.closing.subscribe();
+    let feed = Feed { app, headers: h, space, rx, seq, queue: events.into(), checked: Instant::now(), closing };
+    let stream = futures_util::stream::unfold(feed, |mut f| async move { f.next().await.map(|e| (Ok::<_, Infallible>(e), f)) });
+    let mut res = Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(25))).into_response();
+    // nginx (Reverse-Proxy) puffert sonst den Strom
+    res.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
+    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     res
 }
 
