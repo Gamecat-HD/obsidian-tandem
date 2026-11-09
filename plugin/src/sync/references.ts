@@ -27,13 +27,24 @@ export async function referencingNotes(
 	notes: NoteSource[],
 	stillResolves: (name: string, notePath: string) => boolean,
 ): Promise<string[]> {
-	const name = path.split("/").pop() ?? path;
-	const out: string[] = [];
+	return (await referencingNotesMany([path], notes, stillResolves)).get(path) ?? [];
+}
+
+/** Wie `referencingNotes` für mehrere gelöschte Dateien – jede Notiz wird dabei nur einmal gelesen. */
+export async function referencingNotesMany(
+	paths: string[],
+	notes: NoteSource[],
+	stillResolves: (name: string, notePath: string) => boolean,
+): Promise<Map<string, string[]>> {
+	const out = new Map<string, string[]>(paths.map((p) => [p, []]));
+	if (!paths.length) return out;
 	for (const n of notes) {
-		if (n.path === path) continue;
-		if (!mentions(await n.read(), path)) continue;
-		if (stillResolves(name, n.path)) continue;
-		out.push(n.path);
+		const text = await n.read();
+		for (const path of paths) {
+			if (n.path === path || !mentions(text, path)) continue;
+			if (stillResolves(path.split("/").pop() ?? path, n.path)) continue;
+			out.get(path)!.push(n.path);
+		}
 	}
 	return out;
 }

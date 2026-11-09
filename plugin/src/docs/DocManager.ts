@@ -18,9 +18,18 @@ interface Live {
 	persistTimer: number | null;
 	releaseTimer: number | null;
 	loaded: Promise<void>;
+	/** Stand aus IndexedDB wird gerade eingespielt (ist schon gespeichert). */
+	loading: boolean;
+	/** Laufende `withDoc`-Abgleiche vor ihrem Arbeitsschritt: Sie übernehmen fremde Änderungen ohnehin. */
+	quiet: number;
+	/** Dauer des letzten Kodierens beim Speichern (ms) – große Docs seltener speichern. */
+	encodeMs: number;
 }
 
 const PERSIST_DELAY = 400;
+/** Speichern darf höchstens etwa 1/PERSIST_COST_FACTOR der Zeit kosten (große Docs, Index mit Tausenden Einträgen). */
+const PERSIST_COST_FACTOR = 25;
+const PERSIST_MAX_DELAY = 4000;
 const RELEASE_DELAY = 3000;
 
 export class DocManager {
@@ -53,7 +62,7 @@ export class DocManager {
 	}
 
 	/** Doc holen (Referenz +1). `awareness` nur für Live-Ansichten. */
-	async acquire(docId: string, opts: { awareness?: boolean } = {}): Promise<DocSession> {
+	async acquire(docId: string, opts: { awareness?: boolean; quiet?: boolean } = {}): Promise<DocSession> {
 		let l = this.live.get(docId);
 		if (l && opts.awareness && !l.session.awareness) {
 			// Upgrade auf Live-Ansicht: Session mit Awareness neu aufbauen (selbes Y.Doc).
@@ -68,9 +77,16 @@ export class DocManager {
 		if (!l) {
 			const doc = new Y.Doc();
 			const session = this.newSession(docId, doc, opts);
-			const entry: Live = { session, refs: 0, persistTimer: null, releaseTimer: null, loaded: Promise.resolve() };
+			const entry: Live = { session, refs: 0, persistTimer: null, releaseTimer: null, loaded: Promise.resolve(), loading: false, quiet: 0, encodeMs: 0 };
 			entry.loaded = this.store.get(docName(this.space, docId)).then((rec) => {
-				if (rec?.state?.length) Y.applyUpdate(doc, rec.state, REMOTE);
+				if (rec?.state?.length) {
+					entry.loading = true;
+					try {
+						Y.applyUpdate(doc, rec.state, REMOTE);
+					} finally {
+						entry.loading = false;
+					}
+				}
 				entry.base = rec?.base;
 				entry.edited = rec?.edited;
 				// Verschlüsselt: erst jetzt abonnieren – ab der gespeicherten Log-Position, mit den offenen Updates.
@@ -79,14 +95,21 @@ export class DocManager {
 			const a = this.authorship;
 			if (a && docId !== INDEX_DOC) trackAuthorship(doc, a.who, { ...a, ignore: [REMOTE, ...(a.ignore ?? [])] });
 			doc.on("update", (_u: Uint8Array, origin: unknown) => {
-				if (origin === REMOTE) this.onRemoteUpdate?.(docId);
-				else entry.edited = Date.now();
+				if (entry.loading) {
+					// Gespeicherter Stand: nichts neu zu speichern. Die Datei abgleichen lassen, außer ein Abgleich lädt gerade.
+					if (entry.quiet === 0) this.onRemoteUpdate?.(docId);
+					return;
+				}
+				if (origin === REMOTE) {
+					if (entry.quiet === 0) this.onRemoteUpdate?.(docId);
+				} else entry.edited = Date.now();
 				this.schedulePersist(docId);
 			});
 			this.hookDirty(docId, session);
 			this.live.set(docId, (l = entry));
 		}
 		l.refs++;
+		if (opts.quiet) l.quiet++;
 		if (l.releaseTimer !== null) window.clearTimeout(l.releaseTimer);
 		l.releaseTimer = null;
 		await l.loaded;
@@ -126,12 +149,34 @@ export class DocManager {
 		else l.releaseTimer = window.setTimeout(drop, RELEASE_DELAY);
 	}
 
-	/** Kurzzeitig laden, synchronisieren (falls online) und `fn` ausführen. */
-	async withDoc<T>(docId: string, fn: (s: DocSession, l: { base?: string; setBase(b: string): void }) => T | Promise<T>, syncTimeout = 4000): Promise<T> {
-		const s = await this.acquire(docId);
+	/**
+	 * Kurzzeitig laden, synchronisieren (falls online) und `fn` ausführen.
+	 * `reconciles`: `fn` gleicht selbst Datei und Doc ab. Bis `fn` startet, lösen fremde Änderungen (und der lokale
+	 * Stand beim Laden) dann keinen weiteren Abgleich über `onRemoteUpdate` aus – `fn` sieht sie ohnehin. Sonst
+	 * stieße jeder Abgleich gleich den nächsten an.
+	 */
+	async withDoc<T>(
+		docId: string,
+		fn: (s: DocSession, l: { base?: string; setBase(b: string): void }) => T | Promise<T>,
+		syncTimeout = 4000,
+		opts: { reconciles?: boolean } = {},
+	): Promise<T> {
+		const quiet = !!opts.reconciles;
+		let s: DocSession;
 		try {
-			if (this.conn.status === "online") await s.whenSynced(syncTimeout);
-			const l = this.live.get(docId)!;
+			s = await this.acquire(docId, { quiet });
+		} catch (e) {
+			const l = this.live.get(docId);
+			if (l && quiet) l.quiet--;
+			throw e;
+		}
+		const l = this.live.get(docId)!;
+		try {
+			try {
+				if (this.conn.status === "online") await s.whenSynced(syncTimeout);
+			} finally {
+				if (quiet) l.quiet--;
+			}
 			return await fn(s, {
 				base: l.base,
 				setBase: (b) => {
@@ -185,7 +230,11 @@ export class DocManager {
 		if (this.destroyed) return;
 		const l = this.live.get(docId);
 		if (!l || l.persistTimer !== null) return;
-		l.persistTimer = window.setTimeout(() => void this.persistNow(docId, l), PERSIST_DELAY);
+		// Der Index bleibt immer geladen und wird nur per Zeitgeber gesichert: kurz halten, sonst kann ein
+		// Absturz offline gelöschte/umbenannte Dateien zurückbringen bzw. doppeln.
+		const delay =
+			docId === INDEX_DOC ? PERSIST_DELAY : Math.min(PERSIST_MAX_DELAY, Math.max(PERSIST_DELAY, l.encodeMs * PERSIST_COST_FACTOR));
+		l.persistTimer = window.setTimeout(() => void this.persistNow(docId, l), delay);
 	}
 
 	private async persistNow(docId: string, l: Live) {
@@ -193,13 +242,21 @@ export class DocManager {
 		l.persistTimer = null;
 		await l.loaded;
 		if (this.destroyed) return;
+		const t0 = performance.now();
+		const state = Y.encodeStateAsUpdate(l.session.doc);
+		l.encodeMs = performance.now() - t0;
 		await this.store.put({
 			name: docName(this.space, docId),
-			state: Y.encodeStateAsUpdate(l.session.doc),
+			state,
 			base: l.base,
 			edited: l.edited,
 			e2ee: l.session.e2eeState(),
 		});
+	}
+
+	/** Alles, was auf das Speichern wartet, sofort speichern (App geht in den Hintergrund). */
+	async flushAllPersists() {
+		await Promise.all([...this.live].filter(([, l]) => l.persistTimer !== null).map(([id, l]) => this.persistNow(id, l).catch(() => {})));
 	}
 
 	/** Ausstehendes Speichern sofort erledigen (falls das Doc gerade geladen ist). */

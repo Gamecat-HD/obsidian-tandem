@@ -99,13 +99,20 @@ try {
 	const tpl = await mkdtemp(join(tmpdir(), "tandem-bench-vault-"));
 	await mkdir(join(tpl, ".obsidian"), { recursive: true });
 	await writeFile(join(tpl, ".obsidian/app.json"), JSON.stringify({ promptDelete: false }));
+	const tCreate = now();
 	await a.evaluate(async (n) => {
 		await app.vault.createFolder("Massen").catch(() => {});
 		for (let i = 0; i < n; i++) await app.vault.create(`Massen/Notiz ${String(i).padStart(4, "0")}.md`, `# Notiz ${i}\n\n${"Lorem ipsum dolor sit amet. ".repeat(20)}\n`);
 	}, NOTES);
 	const tUp = now();
-	await idle(a, 300000);
-	results.uploadNotes = { notes: NOTES, ms: Math.round(now() - tUp) };
+	await idle(a, 600000);
+	results.uploadNotes = { notes: NOTES, ms: Math.round(now() - tUp), createAndUploadMs: Math.round(now() - tCreate) };
+	console.log(`Notizen anlegen + hochladen:  ${NOTES} in ${(results.uploadNotes.createAndUploadMs / 1000).toFixed(1)} s (davon ${(results.uploadNotes.ms / 1000).toFixed(1)} s Nachlauf)`);
+	// Bei B kommen die Notizen live an: bis B alle hat und fertig ist
+	await waitFor(() => b.evaluate((n) => app.vault.getFiles().filter((f) => f.path.startsWith("Massen/")).length >= n, NOTES), { interval: 100, timeout: 600000, what: "Notizen bei B" });
+	await idle(b, 600000);
+	results.liveBulkB = { ms: Math.round(now() - tCreate) };
+	console.log(`… bei B vollständig nach:     ${(results.liveBulkB.ms / 1000).toFixed(1)} s`);
 	const c = await client(server, "carol", { device: "C", vaultTemplate: tpl, login: false });
 	handles.push(c);
 	const total = await a.evaluate(() => app.vault.getFiles().length);
@@ -118,6 +125,21 @@ try {
 	await waitFor(() => c.evaluate((t) => app.vault.getFiles().length >= t, total), { interval: 100, timeout: 300000, what: "Erstabgleich" });
 	results.initialSync = { files: total, ms: Math.round(now() - start) };
 	console.log(`Erstabgleich neues Gerät:     ${total} Dateien in ${(results.initialSync.ms / 1000).toFixed(1)} s (inkl. ${3 * 5} MiB Anhänge)`);
+	await idle(c, 600000);
+	results.initialSync.idleMs = Math.round(now() - start);
+	console.log(`… bis C nichts mehr zu tun hat: ${(results.initialSync.idleMs / 1000).toFixed(1)} s`);
+	// Inhalt prüfen (nicht gemessen): jede Massen-Notiz bei C wie bei A
+	const bad = await c.evaluate(async (n) => {
+		let wrong = 0;
+		for (let i = 0; i < n; i++) {
+			const f = app.vault.getFileByPath(`Massen/Notiz ${String(i).padStart(4, "0")}.md`);
+			const t = f ? await app.vault.read(f) : null;
+			if (t !== `# Notiz ${i}\n\n${"Lorem ipsum dolor sit amet. ".repeat(20)}\n`) wrong++;
+		}
+		return wrong;
+	}, NOTES);
+	results.initialSync.wrongContent = bad;
+	console.log(`Inhalt bei C: ${bad === 0 ? "alle korrekt" : `${bad} FALSCH`}`);
 	await rm(tpl, { recursive: true, force: true });
 	results.serverRssAfterSyncMiB = +((await real.rssKib()) / 1024).toFixed(1);
 	console.log(`Server-RSS danach:            ${results.serverRssAfterSyncMiB} MiB`);

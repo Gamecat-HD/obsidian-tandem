@@ -141,6 +141,8 @@ export default class TandemPlugin extends Plugin {
 		this.registerDomEvent(window, "online", () => this.conn?.kick());
 		// Mobil: im Hintergrund trennen (Akku), beim Zurückkehren sofort neu abgleichen.
 		this.registerDomEvent(document, "visibilitychange", () => {
+			// Große Docs werden verzögert gespeichert – bevor das System die App womöglich beendet, alles sichern.
+			if (document.hidden) void this.sync?.docs.flushAllPersists();
 			if (!Platform.isMobile || !this.conn) return;
 			if (document.hidden) {
 				this.hiddenTimer = window.setTimeout(() => this.conn?.stop(), 20000);
