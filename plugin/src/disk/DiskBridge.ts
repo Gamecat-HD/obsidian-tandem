@@ -26,6 +26,11 @@ export interface BridgeHooks {
 	readOnly(): boolean;
 	/** Schreibzugriff auf eine .ink-Datei mit Ink Blocks abstimmen (dessen Speicher-Warteschlange). */
 	exclusive?<T>(path: string, fn: () => Promise<T>): Promise<T>;
+	/**
+	 * Abgleich in die Warteschlange stellen statt ihn sofort abzuwarten (fällt mit schon wartenden Abgleichen
+	 * desselben Docs zusammen, z. B. aus der Änderungsliste beim Verbinden).
+	 */
+	queueReconcile?(docId: string): void;
 }
 
 const LOCAL = Symbol("tandem-disk");
@@ -266,7 +271,10 @@ export class DiskBridge {
 		if (prev && !prev.del && prev.path !== entry.path && (!owner || owner === docId) && vault.getAbstractFileByPath(prev.path)) {
 			await this.rename(prev.path, entry.path);
 		}
-		if (entry.kind !== "blob" && (!prev || prev.del || !vault.getFileByPath(entry.path))) await this.reconcile(docId);
+		if (entry.kind !== "blob" && (!prev || prev.del || !vault.getFileByPath(entry.path))) {
+			if (this.hooks.queueReconcile) this.hooks.queueReconcile(docId);
+			else await this.reconcile(docId);
+		}
 	}
 
 	static isSyncable(file: TFile, ignore: RegExp[]): boolean {

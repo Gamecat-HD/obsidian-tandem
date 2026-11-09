@@ -58,6 +58,24 @@ export const DEFAULT_IGNORE = [
 	/(^|\/)\.DS_Store$/,
 ];
 
+/**
+ * Gleichzeitige Hintergrund-Abgleiche. Notizen warten fast nur auf das Netz (Abo → Step2, eine Rundlaufzeit), daher
+ * viele parallel; Anhänge liegen beim Übertragen ganz im Speicher (siehe TransferGuard), daher wenige.
+ */
+const DOC_PARALLEL = 16;
+const BLOB_PARALLEL = 4;
+/** So viele IndexedDB-Lesezugriffe bzw. Datei-Hashes beim Scan gleichzeitig. */
+const SCAN_PARALLEL = 32;
+
+/** `fn` für alle Elemente, höchstens `n` gleichzeitig. */
+async function eachLimited<T>(items: T[], n: number, fn: (x: T) => Promise<void>) {
+	let i = 0;
+	const worker = async () => {
+		while (i < items.length) await fn(items[i++]);
+	};
+	await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+}
+
 /** Begrenzte Parallelität für Hintergrund-Abgleiche. */
 class Limiter {
 	private active = 0;
@@ -84,7 +102,12 @@ export class SpaceSync {
 	blobs!: BlobSync;
 	private refs: EventRef[] = [];
 	private offs: (() => void)[] = [];
-	private limiter = new Limiter(4);
+	private limiter = new Limiter(DOC_PARALLEL);
+	private blobLimiter = new Limiter(BLOB_PARALLEL);
+	/** Abgleiche, die noch in der Warteschlange stehen (ein weiterer Anlass ändert nichts, sie lesen beim Start alles neu). */
+	private queuedReconciles = new Set<string>();
+	/** docIds, deren lokaler Stand eine Grundlage (`base`) hat – einmal gesehen, bleibt das so. */
+	private based = new Set<string>();
 	private seq = 0;
 	private remoteTimers = new Map<string, number>();
 	/** Von der InkBridge gesetzt, wenn Ink Blocks `api.exclusive` anbietet. */
@@ -121,6 +144,7 @@ export class SpaceSync {
 			origin: () => this.origin,
 			readOnly: () => this.role() === "read",
 			exclusive: <T,>(path: string, fn: () => Promise<T>) => (this.inkExclusive ? this.inkExclusive(path, fn) : fn()),
+			queueReconcile: (id) => this.trackReconcile(id),
 		});
 		this.blobs = new BlobSync(app, this.index, this.bridge, this.o.store, this.o.space, this.o.http, this.o.key ?? null, (t) => this.o.onTransferLost?.(t));
 		this.blobs.represented = (path, hash) => this.o.represented?.(path, hash) ?? false;
@@ -144,7 +168,7 @@ export class SpaceSync {
 				docId,
 				window.setTimeout(() => {
 					this.remoteTimers.delete(docId);
-					this.track(() => this.bridge.reconcile(docId));
+					this.trackReconcile(docId);
 				}, 250),
 			);
 		};
@@ -158,7 +182,7 @@ export class SpaceSync {
 				if (!entry) continue;
 				const prev = change.oldValue as IndexEntry | undefined;
 				if (!entry.del && contested.has(entry.path)) continue;
-				this.track(() => this.applyRemoteEntry(id, entry, prev));
+				this.track(() => this.applyRemoteEntry(id, entry, prev), entry.kind === "blob" ? "blob" : "doc");
 			}
 			if (contested.size) this.track(() => this.resolveConflicts());
 			this.binder.refresh();
@@ -173,7 +197,7 @@ export class SpaceSync {
 					const e = this.index.get(docId);
 					if (!e || e.del || e.kind === "blob") continue;
 					if (this.binder.isBound(e.path)) continue;
-					this.track(() => this.bridge.reconcile(docId));
+					this.trackReconcile(docId);
 				}
 				if (seq > this.seq) {
 					this.seq = seq;
@@ -216,13 +240,13 @@ export class SpaceSync {
 	}
 
 	syncable(path: string) {
-		return ![...DEFAULT_IGNORE, ...this.o.ignore].some((r) => r.test(path));
+		return !DEFAULT_IGNORE.some((r) => r.test(path)) && !this.o.ignore.some((r) => r.test(path));
 	}
 
-	private track(fn: () => Promise<void>) {
+	private track(fn: () => Promise<void>, lane: "doc" | "blob" = "doc") {
 		if (!this.started && this.refs.length) return;
 		this.pending++;
-		void this.limiter
+		void (lane === "blob" ? this.blobLimiter : this.limiter)
 			.run(fn)
 			.catch((e) => console.warn("[tandem]", e))
 			.finally(() => {
@@ -231,15 +255,25 @@ export class SpaceSync {
 			});
 	}
 
+	/** Datei ⇄ Doc abgleichen lassen; steht schon ein Abgleich dieses Docs aus, genügt der. */
+	private trackReconcile(id: string) {
+		if (this.queuedReconciles.has(id) || (!this.started && this.refs.length)) return;
+		this.queuedReconciles.add(id);
+		this.track(() => {
+			this.queuedReconciles.delete(id);
+			return this.bridge.reconcile(id);
+		});
+	}
+
 	/** Übersprungene Anhänge erneut übertragen (Einstellungen). */
 	async retrySkipped() {
 		for (const t of await this.blobs.guard.clear()) {
 			if (t.dir === "down" && t.hash) {
 				const hash = t.hash;
-				this.track(() => this.blobs.fetch(t.path, hash));
+				this.track(() => this.blobs.fetch(t.path, hash), "blob");
 			} else if (t.dir === "up") {
 				const file = this.o.app.vault.getFileByPath(t.path);
-				if (file) this.track(() => this.blobs.upload(file));
+				if (file) this.track(() => this.blobs.upload(file), "blob");
 			}
 		}
 	}
@@ -270,6 +304,7 @@ export class SpaceSync {
 		const files = app.vault.getFiles().filter((f) => this.syncable(f.path));
 		const ro = this.role() === "read";
 		const fresh: { path: string; kind: ReturnType<typeof kindForPath>; hash?: string }[] = [];
+		const unknown: TFile[] = [];
 		for (const f of files) {
 			if (ro || this.index.idForPath(f.path)) continue;
 			const kind = kindForPath(f.path);
@@ -287,8 +322,19 @@ export class SpaceSync {
 				} else await this.bridge.trash(f.path);
 				continue;
 			}
-			fresh.push({ path: f.path, kind, hash: kind === "blob" ? undefined : await sha256Hex(await app.vault.read(f)) });
+			unknown.push(f);
 		}
+		// Neue Dateien lesen und hashen – parallel (Erstimport: Tausende Dateien).
+		await eachLimited(unknown, SCAN_PARALLEL, async (f) => {
+			const kind = kindForPath(f.path);
+			if (kind === "blob") return void fresh.push({ path: f.path, kind });
+			try {
+				fresh.push({ path: f.path, kind, hash: await sha256Hex(await app.vault.read(f)) });
+			} catch (e) {
+				// Inzwischen gelöscht/umbenannt: Das melden die Vault-Ereignisse, der Scan läuft weiter.
+				console.warn("[tandem] Scan", f.path, e);
+			}
+		});
 		let added = 0;
 		this.index.doc.transact(() => {
 			for (const n of fresh) {
@@ -299,7 +345,20 @@ export class SpaceSync {
 		});
 		if (added) this.log(`${added} neue Datei(en) eingetragen`);
 		await this.resolveConflicts();
-		for (const f of app.vault.getFiles().filter((f) => this.syncable(f.path))) {
+		const all = app.vault.getFiles().filter((f) => this.syncable(f.path));
+		// Unveränderte Notizen ohne gespeicherte Grundlage (z. B. Abgleich vor dem Beenden nicht fertig) brauchen einen
+		// Abgleich. Nachsehen parallel statt einzeln nacheinander, und nur einmal pro Doc (bei jedem Wiederverbinden).
+		const check: string[] = [];
+		for (const f of all) {
+			const old = stats[f.path];
+			if (!old || old[0] !== f.stat.mtime || old[1] !== f.stat.size) continue;
+			const id = this.index.idForPath(f.path);
+			if (id && !this.based.has(id) && this.index.get(id)?.kind !== "blob") check.push(id);
+		}
+		await eachLimited(check, SCAN_PARALLEL, async (id) => {
+			if (await this.hasBase(id)) this.based.add(id);
+		});
+		for (const f of all) {
 			next[f.path] = [f.stat.mtime, f.stat.size];
 			const old = stats[f.path];
 			const changed = !old || old[0] !== f.stat.mtime || old[1] !== f.stat.size;
@@ -309,13 +368,13 @@ export class SpaceSync {
 			if (e.kind === "blob") {
 				// Absturz beim Schreiben eines Downloads: Datei womöglich halb → neu laden, nie hochladen.
 				if (this.blobs.interrupted(f.path)) {
-					this.track(() => this.blobs.repair(f.path));
+					this.track(() => this.blobs.repair(f.path), "blob");
 					continue;
 				}
 				if (ro) continue;
-				if (changed || !e.hash || this.blobs.pendingUploads.has(f.path)) this.track(() => this.blobs.upload(f));
-			} else if (changed || !(await this.hasBase(id))) {
-				this.track(() => this.bridge.reconcile(id));
+				if (changed || !e.hash || this.blobs.pendingUploads.has(f.path)) this.track(() => this.blobs.upload(f), "blob");
+			} else if (changed || !this.based.has(id)) {
+				this.trackReconcile(id);
 			}
 		}
 		// Im Index, aber lokal fehlend → anlegen (sofern nicht absichtlich gelöscht – das meldet onDelete).
@@ -323,8 +382,8 @@ export class SpaceSync {
 			if (!this.syncable(e.path) || app.vault.getAbstractFileByPath(e.path)) continue;
 			if (this.index.idForPath(e.path) !== id) continue;
 			if (e.kind === "blob") {
-				if (e.hash) this.track(() => this.blobs.fetch(e.path, e.hash!));
-			} else this.track(() => this.bridge.reconcile(id));
+				if (e.hash) this.track(() => this.blobs.fetch(e.path, e.hash!), "blob");
+			} else this.trackReconcile(id);
 		}
 		await store.setMeta(`stats:${space}`, next);
 	}
@@ -355,8 +414,8 @@ export class SpaceSync {
 			if (winner) {
 				const w = this.index.get(winner)!;
 				if (w.kind === "blob") {
-					if (w.hash) this.track(() => this.blobs.fetch(oldPath, w.hash!));
-				} else this.track(() => this.bridge.reconcile(winner));
+					if (w.hash) this.track(() => this.blobs.fetch(oldPath, w.hash!), "blob");
+				} else this.trackReconcile(winner);
 			}
 		}
 	}
@@ -408,7 +467,7 @@ export class SpaceSync {
 		if (this.ro) return;
 		if (!(f instanceof TFile) || !this.syncable(f.path) || this.bridge.isOwnWrite(f.path)) return;
 		const kind = kindForPath(f.path);
-		if (kind === "blob") return this.track(() => this.blobs.upload(f));
+		if (kind === "blob") return this.track(() => this.blobs.upload(f), "blob");
 		this.track(async () => {
 			const hash = await sha256Hex(await this.o.app.vault.read(f));
 			const id = this.index.add(f.path, kind, { hash, origin: this.origin });
@@ -423,7 +482,7 @@ export class SpaceSync {
 			// Nicht anhand des eigenen Schreib-Markers überspringen: Eine echte Änderung kurz nach einem
 			// Download (z. B. Excel-Datei aus einem anderen Programm) ginge sonst verloren. Der Upload
 			// vergleicht den Hash mit dem Index und tut bei der eigenen Fassung nichts.
-			return this.track(() => this.blobs.upload(f));
+			return this.track(() => this.blobs.upload(f), "blob");
 		}
 		const id = this.index.idForPath(f.path);
 		if (!id) return this.onCreate(f);
@@ -437,7 +496,7 @@ export class SpaceSync {
 		}
 		void this.o.app.vault.read(f).then((t) => {
 			if (this.bridge.isOwnWrite(f.path, t)) return;
-			this.track(() => this.bridge.reconcile(id));
+			this.trackReconcile(id);
 		});
 	}
 
@@ -514,7 +573,7 @@ export class SpaceSync {
 		if (!e?.del || !e.hash || this.index.idForPath(e.path)) return false;
 		this.index.update(id, { del: false });
 		const hash = e.hash;
-		this.track(() => this.blobs.fetch(e.path, hash));
+		this.track(() => this.blobs.fetch(e.path, hash), "blob");
 		this.log(`${e.path}: wiederhergestellt`);
 		return true;
 	}
