@@ -1,5 +1,11 @@
 # Änderungen
 
+## Nächste Version
+
+Nur das Plugin hat sich geändert.
+
+- **Warnung, wenn ein gelöschter Anhang noch verwendet wird:** Löscht jemand ein Bild oder PDF, das eine Notiz noch nutzt, erscheint auf allen Geräten ein Hinweis mit „Wiederherstellen“: wer gelöscht hat und welche Notizen betroffen sind. Ein Klick holt den Anhang auf alle Geräte zurück. Das gilt auch für Hintergründe von Ink-Blöcken. Die stehen in einem Codeblock, Obsidian erkennt sie nicht als Link, und die Datei wirkt ungenutzt. Unbenutzte Anhänge und ganze gelöschte Ordner lösen keinen Hinweis aus. Test `m21`.
+
 ## 0.6.4
 
 Nur das Plugin hat sich geändert; der Server muss nicht neu ausgerollt werden.

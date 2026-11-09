@@ -3,7 +3,7 @@ import * as Y from "yjs";
 import { Connection, type ConnStatus } from "./net/Connection";
 import { LocalStore } from "./docs/LocalStore";
 import { collabBaseExtension } from "./editor/collab";
-import { SpaceSync } from "./sync/SpaceSync";
+import { SpaceSync, type ReferencedDelete } from "./sync/SpaceSync";
 import { Presence, initials, type Peer } from "./presence/Presence";
 import { DEFAULT_SETTINGS, formatSize, TandemSettingTab, type TandemSettings } from "./settings";
 import { InkBridge } from "./ink/InkBridge";
@@ -139,6 +139,29 @@ export default class TandemPlugin extends Plugin {
 			const last = Number(this.app.loadLocalStorage(LS_UPDATE_CHECK) ?? 0);
 			if (Date.now() - last > 24 * 3600 * 1000) window.setTimeout(() => void this.checkUpdate(true), 15000);
 		});
+	}
+
+	/** Hinweis: Gelöschte Anhänge werden noch verwendet. Bleibt stehen, bis man ihn anklickt. */
+	private warnReferencedDelete(items: ReferencedDelete[], restore: (() => number) | null) {
+		const base = (p: string) => p.split("/").pop() ?? p;
+		const note = (p: string) => base(p).replace(/\.md$/, "");
+		const frag = createFragment((f) => {
+			f.createDiv({ text: "Tandem: Gelöscht, aber noch verwendet" }).style.fontWeight = "600";
+			for (const i of items.slice(0, 5)) {
+				const who = i.local ? "Hier gelöscht" : `Gelöscht von ${i.by ?? "jemand anderem"}`;
+				const used = i.notes.slice(0, 3).map(note).join(", ") + (i.notes.length > 3 ? ` und ${i.notes.length - 3} weitere` : "");
+				f.createDiv({ text: `„${base(i.path)}“ (${who}): verwendet in ${used}` });
+			}
+			if (items.length > 5) f.createDiv({ text: `… und ${items.length - 5} weitere Anhänge` });
+			if (!restore) return;
+			const btn = f.createEl("button", { text: items.length > 1 ? "Alle wiederherstellen" : "Wiederherstellen", cls: "mod-cta" });
+			btn.style.marginTop = "6px";
+			btn.onclick = () => {
+				const n = restore();
+				new Notice(n ? `Tandem: ${n} Anhang/Anhänge wiederhergestellt – auf allen Geräten.` : "Tandem: Nichts wiederhergestellt (inzwischen schon zurück oder Name neu vergeben).");
+			};
+		});
+		new Notice(frag, 0);
 	}
 
 	async onunload() {
@@ -286,6 +309,7 @@ export default class TandemPlugin extends Plugin {
 			http: () => this.http(),
 			log: (m) => console.log("[tandem]", m),
 			key: this.key,
+			onReferencedDelete: (items, restore) => this.warnReferencedDelete(items, restore),
 			onTransferLost: (t) => {
 				const name = t.path.split("/").pop();
 				new Notice(`Tandem: Beim Übertragen von „${name}“${formatSize(t.size)} wurde die App beendet. Die Datei wird auf diesem Gerät übersprungen. Erneut versuchen: Einstellungen → Tandem.`, 20000);
