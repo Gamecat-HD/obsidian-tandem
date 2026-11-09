@@ -46,30 +46,61 @@
 .tandem-invite-result:empty { display: none; }
 .tandem-code { font-size: 1.2em; font-weight: 700; letter-spacing: 0.05em; padding: 2px 8px; user-select: all; }
 
-/* ── Blame-Spalte (wer hat welche Zeile zuletzt geändert) ─────────────── */
-.cm-gutter.tandem-blame .tandem-blame-line {
-	width: 9em;
-	box-sizing: border-box;
-	padding: 0 6px 0 7px;
-	border-left: 3px solid var(--tandem-blame-color, transparent);
+/* ── Blame: Balken + Namen im linken Rand, Text bleibt, wo er ist ───── */
+.tandem-blame-layer {
+	pointer-events: none;
+}
+.tandem-blame-block {
+	position: absolute;
+	width: 3px;
+	pointer-events: auto;
+}
+.tandem-blame-bar {
+	position: absolute;
+	inset: 2px 0;
+	border-radius: 2px;
+	background: var(--tandem-blame-color);
+	opacity: 0.55;
+	transition: opacity 120ms ease, transform 120ms ease;
+}
+.tandem-blame-block.is-unknown .tandem-blame-bar {
+	background: repeating-linear-gradient(to bottom, var(--background-modifier-border) 0 3px, transparent 3px 6px);
+	opacity: 1;
+}
+.tandem-blame-block:hover .tandem-blame-bar {
+	opacity: 1;
+	transform: scaleX(1.6);
+}
+.tandem-blame-label {
+	position: absolute;
+	right: 10px;
+	top: 0;
+	line-height: var(--line-height-normal);
+	padding-top: 0.2em;
+	max-width: 140px;
 	color: var(--text-faint);
 	font-size: var(--font-ui-smaller);
+	font-variant-numeric: tabular-nums;
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
-	text-align: left;
-	cursor: default;
+	text-align: right;
+	transition: color 120ms ease;
 }
-.cm-gutter.tandem-blame .tandem-blame-line.is-first {
+.tandem-blame-block:hover .tandem-blame-label {
 	color: var(--text-muted);
 }
-.cm-gutter.tandem-blame .tandem-blame-line.is-unknown {
-	border-left: 3px dotted var(--background-modifier-border);
+/* Zeilenende-Angabe nur, wenn links kein Platz für Namen ist */
+.tandem-blame-inline {
+	display: none;
 }
-.cm-gutter.tandem-blame .tandem-blame-spacer {
-	border-left-color: transparent;
-	visibility: hidden;
-}
-.is-mobile .cm-gutter.tandem-blame .tandem-blame-line {
-	width: 6.5em;
+.tandem-blame-narrow .tandem-blame-inline {
+	display: inline;
+	margin-left: 1.5em;
+	color: var(--text-faint);
+	font-size: var(--font-ui-smaller);
+	font-style: italic;
+	white-space: nowrap;
+	user-select: none;
+	pointer-events: auto;
 }

@@ -1,17 +1,23 @@
-// M22: Blame – wer hat welche Zeile zuletzt geändert (Spalte im Editor, Datei von außen, beide Seiten gleich).
+// M22: Blame – wer hat welche Zeile zuletzt geändert (Balken + Namen im Rand, Text bleibt stehen, schmale
+// Ansicht mit Angabe am Zeilenende, Datei von außen, beide Seiten gleich).
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { check, client, cursorTo, editorText, idle, isBound, openFile, readFile, startServer, type, waitFor } from "../lib.mjs";
 
 const blame = (h, p) => h.evaluate((p) => app.plugins.plugins.tandem.api.blame(p), p);
-const gutter = (h) =>
+const marks = (h) =>
 	h.evaluate(() =>
-		[...document.querySelectorAll(".workspace-leaf.mod-active .cm-gutter.tandem-blame .tandem-blame-line:not(.tandem-blame-spacer)")].map((e) => ({
-			text: e.textContent,
-			title: e.title,
-			first: e.classList.contains("is-first"),
+		[...document.querySelectorAll(".workspace-leaf.mod-active .tandem-blame-block")].map((e) => ({
+			text: e.querySelector(".tandem-blame-label")?.textContent ?? "",
+			tip: e.getAttribute("aria-label") ?? "",
+			unknown: e.classList.contains("is-unknown"),
 		})),
 	);
+const contentLeft = (h) => h.evaluate(() => document.querySelector(".workspace-leaf.mod-active .cm-content").getBoundingClientRect().left);
+const inline = (h) => h.evaluate(() => {
+	const e = document.querySelector(".workspace-leaf.mod-active .tandem-blame-inline");
+	return e && getComputedStyle(e).display !== "none" ? e.textContent : null;
+});
 
 export default async function () {
 	const server = await startServer({ rust: true });
@@ -68,24 +74,36 @@ export default async function () {
 		await openFile(a, P);
 		await waitFor(() => isBound(a, P), { what: "Alice wieder gekoppelt" });
 
-		// Spalte im Editor einschalten
+		// Anzeige einschalten: Balken + Namen im Rand, der Text verschiebt sich nicht
+		const left0 = await contentLeft(a);
 		await a.evaluate(() => app.plugins.plugins.tandem.setBlame(true));
-		await waitFor(async () => (await gutter(a)).some((g) => g.text.startsWith("Bob")), { what: "Blame-Spalte zeigt Bob" });
-		const g = await gutter(a);
-		check(g.some((x) => x.text.startsWith("Alice") && x.first), `Spalte: ${g.map((x) => x.text.trim() || "│").join(" / ")}`);
-		check(g.some((x) => x.title.includes("Tablet")), "Tooltip nennt das Gerät");
-		check(g.some((x) => x.title.includes("Datei von außen")), "Tooltip nennt Datei-Herkunft");
+		await waitFor(async () => (await marks(a)).some((m) => m.text.startsWith("Bob")), { what: "Blame zeigt Bob" });
+		const m = await marks(a);
+		check(m.some((x) => x.text.startsWith("Du")), `Ränder (eigene Zeilen als „Du“): ${m.map((x) => x.text || "│").join(" / ")}`);
+		check(m.some((x) => x.tip.includes("Tablet")), "Tooltip nennt das Gerät");
+		check(m.some((x) => x.tip.includes("Datei von außen")), "Tooltip nennt Datei-Herkunft");
+		check(Math.abs((await contentLeft(a)) - left0) < 1, `Text bleibt stehen (links ${left0} → ${await contentLeft(a)})`);
 		await a.screenshot("m22-blame.png");
 
-		// Live: neue Zeile von Bob erscheint in Alices Spalte
+		// Live: neue Zeile von Bob erscheint bei Alice
+		const before = (await marks(a)).length;
 		await cursorTo(b, -1);
-		await type(b, "\nNoch was von Bob");
-		await waitFor(async () => (await gutter(a)).filter((x) => x.text.startsWith("Bob") || (!x.first && x.text.trim() === "")).length >= 2, { what: "Live-Aktualisierung" });
-		check(true, "Spalte aktualisiert sich live");
+		await type(b, "\n\nNoch was von Bob");
+		await waitFor(async () => (await marks(a)).length > before, { what: "Live-Aktualisierung" });
+		check(true, "Anzeige aktualisiert sich live");
+
+		// Schmales Fenster: kein Platz für Namen → Angabe am Ende der Cursor-Zeile
+		await a.cdp.send("Emulation.setDeviceMetricsOverride", { width: 640, height: 900, deviceScaleFactor: 1, mobile: false });
+		await a.evaluate(() => app.workspace.leftSplit.collapse());
+		await a.evaluate(() => app.workspace.activeEditor.editor.setCursor({ line: 2, ch: 3 }));
+		await waitFor(async () => (await inline(a))?.startsWith("Bob"), { what: "Angabe am Zeilenende" });
+		check((await marks(a)).every((x) => x.text === ""), `schmal: nur Balken, am Zeilenende „${await inline(a)}“`);
+		await a.screenshot("m22-blame-schmal.png");
+		await a.cdp.send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
 
 		await a.evaluate(() => app.plugins.plugins.tandem.setBlame(false));
-		await waitFor(async () => (await gutter(a)).length === 0, { what: "Spalte aus" });
-		check(true, "Ausschalten entfernt die Spalte");
+		await waitFor(async () => (await marks(a)).length === 0, { what: "Anzeige aus" });
+		check(true, "Ausschalten entfernt die Anzeige")
 	} finally {
 		await a.close();
 		await b.close();

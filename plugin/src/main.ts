@@ -16,8 +16,8 @@ import type { E2eeParams, WelcomeSpace } from "./net/protocol";
 import { PassphraseModal } from "./ui/Passphrase";
 import { checkTransport } from "./net/transport";
 import { installRelease, latestRelease, newer, reloadPlugin, type Release } from "./ui/Update";
-import { blameExtension } from "./blame/gutter";
-import { AuthorLookup, blameLines, textRuns, type Author } from "./blame/authorship";
+import { blameExtension } from "./blame/view";
+import { AuthorLookup, blameLines, textLines, textRuns, type Author } from "./blame/authorship";
 
 const LS_TOKEN = "tandem-token";
 const LS_DEVICE = "tandem-device";
@@ -362,8 +362,9 @@ export default class TandemPlugin extends Plugin {
 			if ((e.target as HTMLElement | null)?.closest?.(".cm-editor")) this.presence?.touch();
 		});
 		this.registerEvent(this.app.workspace.on("layout-change", () => this.presence?.renderHeaders()));
-		this.ink = new InkBridge(this.app, sync);
+		this.ink = new InkBridge(this.app, sync, () => this.authorInfo());
 		this.ink.start();
+		this.ink.setBlame(this.settings.blame);
 	}
 
 	/** Angemeldete Person (oder Platzhalter, solange keine Verbindung besteht). */
@@ -390,6 +391,7 @@ export default class TandemPlugin extends Plugin {
 		this.blameExt.length = 0;
 		if (on) this.blameExt.push(blameExtension({ me: () => this.authorInfo() }));
 		this.app.workspace.updateOptions();
+		this.ink?.setBlame(on);
 	}
 
 	/** Für Tests/andere Plugins: Blame einer gekoppelten Notiz, pro Zeile. */
@@ -399,8 +401,8 @@ export default class TandemPlugin extends Plugin {
 		const ytext = s.doc.getText("content");
 		const me = this.authorInfo();
 		const lookup = new AuthorLookup(s.doc, (c) => (c === s.doc.clientID ? (me ?? undefined) : undefined));
-		return blameLines(ytext.toString(), textRuns(ytext), lookup).map((b) => ({
-			line: b.line,
+		return blameLines(textLines(ytext.toString()), textRuns(ytext), lookup).map((b) => ({
+			line: b.index + 1,
 			name: b.who.author?.name ?? null,
 			device: b.who.author?.device ?? null,
 			ts: b.who.ts,

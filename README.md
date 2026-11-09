@@ -38,7 +38,7 @@ Self-hosted LiveSync synchronisiert Dateien über CouchDB. Das funktioniert, abe
 | 🖊️ **[Ink Blocks](https://github.com/Gamecat-HD/obsidian-ink-blocks)** | Handschrift-Striche erscheinen **live während des Schreibens** beim anderen |
 | 📊 **[Zellwerk](https://github.com/Gamecat-HD/obsidian-zellwerk)** | Excel-Tabellen (`.xlsx`) **live gemeinsam** bearbeiten: Zellcursor, gleichzeitiges Einfügen von Zeilen, keine Konfliktkopien ([Live-API](docs/LIVE-API.md)) |
 | 📱 **Mobil** | Android und iPad/iPhone. Trennt im Hintergrund, um Akku zu sparen |
-| 🔎 **Blame** | Wie `git blame`: pro Zeile, wer sie zuletzt geändert hat und wann (Befehl „Blame ein/aus“) |
+| 🔎 **Blame** | Wie `git blame`: Farbbalken und Name im Rand, wer welche Zeile zuletzt geändert hat und wann. In Ink Blocks: Striche in der Farbe der Person (Befehl „Blame ein/aus“) |
 | 🕓 **Verlauf & Sicherungen** | Versionsgeschichte je Notiz, tägliche Server-Sicherung, Vault-Kopie vor dem ersten Abgleich |
 | 🔐 **Rechte** | Besitzer / Schreiben / Nur-Lesen, Einladungscodes, einzeln sperrbare Geräte |
 | 🔒 **Ende-zu-Ende-verschlüsselt** (pro Vault) | Notizen, Dateinamen, Anhänge und Cursor verlassen die Geräte nur verschlüsselt, der Server sieht nur Chiffretext. [Details](docs/E2EE.md) |
