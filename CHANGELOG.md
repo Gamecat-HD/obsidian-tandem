@@ -1,5 +1,18 @@
 # Änderungen
 
+## 0.8.1
+
+Nur das Plugin hat sich geändert; der Server muss nicht neu ausgerollt werden.
+
+- **Neues Gerät wurde nie fertig:** Mussten viele Notizen auf einmal abgeglichen werden (neues Gerät, lange offline), lief der Abgleich in einer Endlosschleife: Laden aus dem Gerätespeicher zählte als fremde Änderung und stieß den nächsten Abgleich an. Bei rund 1000 Notizen mit etwas Latenz – und bei 4000 Notizen sogar lokal – kam ein neues Gerät nie zur Ruhe. Jetzt: 1000 Notizen bei 40 ms Latenz in ~6 s statt nie.
+- **Schnellerer Abgleich:** Notizen werden 16 gleichzeitig abgeglichen (Anhänge weiterhin 4), doppelte Aufträge zusammengefasst, beim Start wird parallel gehasht, und die Prüfung „schon abgeglichen“ läuft nur einmal pro Sitzung statt bei jedem Wiederverbinden (mobil: jedes Zurückholen der App). Anlegen + Hochladen von 1000 Notizen bei 40 ms Latenz: 31 s → 8 s.
+- **Datei-Index:** Wird pro geänderter Datei nachgeführt statt bei jeder Änderung komplett neu aufgebaut (4600 Einträge: 5,2 s → 0,7 s).
+- **Weniger Schreiblast:** Große Docs werden seltener lokal gesichert (je nach Gerät bis 4 s, beim Wechsel in den Hintergrund sofort); der Datei-Index bleibt bei 400 ms.
+- Prüfung „gelöschter Anhang noch verwendet“ liest jede Notiz nur noch einmal pro Schub.
+- Namenskonflikt (gleicher Pfad auf zwei Geräten offline angelegt): kein Abgleich mehr auf der Datei, die gerade umbenannt wird.
+
+Messwerte: `docs/PERFORMANCE.md`.
+
 ## 0.8.0
 
 Nur das Plugin hat sich geändert; der Server muss nicht neu ausgerollt werden.
