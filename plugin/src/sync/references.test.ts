@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mentions, referencingNotes } from "./references";
+import { mentions, referencingNotes, referencingNotesMany } from "./references";
 
 const note = (path: string, text: string) => ({ path, read: async () => text });
 
@@ -20,5 +20,14 @@ describe("Verweise auf gelöschte Anhänge", () => {
 		// In „Andere.md“ löst der Name auf eine gleichnamige Datei in einem anderen Ordner auf.
 		const refs = await referencingNotes("Screenshot.jpg", notes, (_n, p) => p === "Andere.md");
 		expect(refs).toEqual(["BAB.md"]);
+	});
+
+	it("prüft mehrere gelöschte Dateien in einem Durchgang und liest jede Notiz nur einmal", async () => {
+		let reads = 0;
+		const n = (path: string, text: string) => ({ path, read: async () => (reads++, text) });
+		const notes = [n("A.md", "![[a.png]] und ![[b.png]]"), n("B.md", "![[b.png]]"), n("C.md", "nichts")];
+		const refs = await referencingNotesMany(["x/a.png", "y/b.png", "z/c.png"], notes, () => false);
+		expect(Object.fromEntries(refs)).toEqual({ "x/a.png": ["A.md"], "y/b.png": ["A.md", "B.md"], "z/c.png": [] });
+		expect(reads).toBe(3);
 	});
 });

@@ -15,7 +15,7 @@ import { EditorBinder } from "../editor/EditorBinder";
 import { BlobSync } from "../blobs/BlobSync";
 import type { SpaceKey } from "../crypto/e2ee";
 import type { Transfer } from "../blobs/TransferGuard";
-import { referencingNotes } from "./references";
+import { referencingNotesMany } from "./references";
 
 /** Ein gelöschter Anhang, auf den Notizen noch verweisen. */
 export interface ReferencedDelete {
@@ -550,12 +550,16 @@ export class SpaceSync {
 			.filter((f) => this.syncable(f.path))
 			.map((f) => ({ path: f.path, read: () => app.vault.cachedRead(f) }));
 		const stillResolves = (name: string, from: string) => !!app.metadataCache.getFirstLinkpathDest(name, from);
-		const items: (ReferencedDelete & { id: string })[] = [];
-		for (const [id, d] of batch) {
+		// Inzwischen wiederhergestellt oder ohne Inhalt auf dem Server: nichts zu melden.
+		const gone = batch.filter(([id, d]) => {
 			const e = this.index.get(id);
-			// Inzwischen wiederhergestellt oder ohne Inhalt auf dem Server: nichts zu melden.
-			if (!e?.del || !e.hash || app.vault.getAbstractFileByPath(d.path)) continue;
-			const refs = await referencingNotes(d.path, notes, stillResolves);
+			return e?.del && e.hash && !app.vault.getAbstractFileByPath(d.path);
+		});
+		// Ein Durchgang über alle Notizen für alle gelöschten Anhänge (Ordner mit vielen Bildern gelöscht).
+		const refsByPath = await referencingNotesMany([...new Set(gone.map(([, d]) => d.path))], notes, stillResolves);
+		const items: (ReferencedDelete & { id: string })[] = [];
+		for (const [id, d] of gone) {
+			const refs = refsByPath.get(d.path) ?? [];
 			if (refs.length) items.push({ id, ...d, notes: refs });
 		}
 		if (!items.length) return;
