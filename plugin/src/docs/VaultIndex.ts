@@ -39,27 +39,67 @@ export function newDocId(): string {
 
 export class VaultIndex {
 	readonly files: Y.Map<IndexEntry>;
+	/**
+	 * Abgeleitete Nachschlagetabellen, bei jeder Änderung von `files` nur für die geänderten Schlüssel nachgeführt
+	 * (vorher: kompletter Neuaufbau je Änderung und lineare Suchen → quadratisch beim Erstabgleich großer Vaults).
+	 */
 	private byPath = new Map<string, string>();
+	/** Pfad → lebende Einträge mit diesem Pfad (mehr als einer = Namenskonflikt). */
+	private claims = new Map<string, Set<string>>();
+	/** Pfad → Grabsteine mit diesem Pfad. */
+	private tombs = new Map<string, Set<string>>();
+	/** Pfade mit mehr als einem lebenden Eintrag. */
+	private contestedPaths = new Set<string>();
+	/** docId → (Pfad, gelöscht), wie zuletzt eingetragen – zum Austragen bei Änderungen. */
+	private seen = new Map<string, { path: string; del: boolean }>();
 
 	constructor(
 		readonly doc: Y.Doc,
 		private userId: () => string,
 	) {
 		this.files = doc.getMap<IndexEntry>("files");
-		this.rebuild();
-		this.files.observe(() => this.rebuild());
+		for (const [id, e] of this.files) this.enter(id, e);
+		this.files.observe((ev) => {
+			for (const id of ev.keysChanged) {
+				this.leave(id);
+				const e = this.files.get(id);
+				if (e) this.enter(id, e);
+			}
+		});
+	}
+
+	private enter(id: string, e: IndexEntry) {
+		const del = !!e.del;
+		this.seen.set(id, { path: e.path, del });
+		const table = del ? this.tombs : this.claims;
+		let set = table.get(e.path);
+		if (!set) table.set(e.path, (set = new Set()));
+		set.add(id);
+		if (del) return;
+		// Bei doppelten Pfaden (gleichzeitig offline angelegt) gewinnt die kleinere docId.
+		const cur = this.byPath.get(e.path);
+		if (cur === undefined || id < cur) this.byPath.set(e.path, id);
+		if (set.size > 1) this.contestedPaths.add(e.path);
+	}
+
+	private leave(id: string) {
+		const s = this.seen.get(id);
+		if (!s) return;
+		this.seen.delete(id);
+		const table = s.del ? this.tombs : this.claims;
+		const set = table.get(s.path);
+		set?.delete(id);
+		if (set && set.size === 0) table.delete(s.path);
+		if (s.del) return;
+		if (!set || set.size <= 1) this.contestedPaths.delete(s.path);
+		if (this.byPath.get(s.path) !== id) return;
+		let min: string | undefined;
+		for (const other of set ?? []) if (min === undefined || other < min) min = other;
+		if (min === undefined) this.byPath.delete(s.path);
+		else this.byPath.set(s.path, min);
 	}
 
 	/** Pfad → docId. Bei doppelten Pfaden (gleichzeitig offline angelegt) gewinnt die kleinere docId. */
-	private rebuild() {
-		this.byPath.clear();
-		for (const [id, e] of this.files) {
-			if (e.del) continue;
-			const cur = this.byPath.get(e.path);
-			if (cur === undefined || id < cur) this.byPath.set(e.path, id);
-		}
-	}
-
 	idForPath(path: string): string | undefined {
 		return this.byPath.get(path);
 	}
@@ -67,7 +107,10 @@ export class VaultIndex {
 	/** Zuletzt gelöschter Eintrag mit diesem Pfad (Grabstein). */
 	deletedIdForPath(path: string): string | undefined {
 		let best: [string, number] | undefined;
-		for (const [id, e] of this.files) if (e.del && e.path === path && (!best || e.ts > best[1])) best = [id, e.ts];
+		for (const id of this.tombs.get(path) ?? []) {
+			const e = this.files.get(id);
+			if (e?.del && e.path === path && (!best || e.ts > best[1] || (e.ts === best[1] && id < best[0]))) best = [id, e.ts];
+		}
 		return best?.[0];
 	}
 
@@ -78,15 +121,19 @@ export class VaultIndex {
 	/** Einträge, die denselben Pfad wie ein Gewinner beanspruchen (Konflikt beim Anlegen). */
 	conflicts(): [string, IndexEntry][] {
 		const out: [string, IndexEntry][] = [];
-		for (const [id, e] of this.files) if (!e.del && this.byPath.get(e.path) !== id) out.push([id, e]);
+		for (const path of this.contestedPaths) {
+			const winner = this.byPath.get(path);
+			for (const id of [...(this.claims.get(path) ?? [])].sort()) {
+				const e = this.files.get(id);
+				if (id !== winner && e && !e.del) out.push([id, e]);
+			}
+		}
 		return out;
 	}
 
 	/** Mehr als ein lebender Eintrag beansprucht diesen Pfad (Konflikt noch nicht aufgelöst). */
 	contested(path: string): boolean {
-		let n = 0;
-		for (const e of this.files.values()) if (!e.del && e.path === path && ++n > 1) return true;
-		return false;
+		return this.contestedPaths.has(path);
 	}
 
 	live(): [string, IndexEntry][] {
