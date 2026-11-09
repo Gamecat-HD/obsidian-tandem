@@ -21,9 +21,14 @@ interface Live {
 	loading: boolean;
 	/** Laufende `withDoc`-Abgleiche vor ihrem Arbeitsschritt: Sie übernehmen fremde Änderungen ohnehin. */
 	quiet: number;
+	/** Dauer des letzten Kodierens beim Speichern (ms) – große Docs seltener speichern. */
+	encodeMs: number;
 }
 
 const PERSIST_DELAY = 400;
+/** Speichern darf höchstens etwa 1/PERSIST_COST_FACTOR der Zeit kosten (große Docs, Index mit Tausenden Einträgen). */
+const PERSIST_COST_FACTOR = 25;
+const PERSIST_MAX_DELAY = 4000;
 const RELEASE_DELAY = 3000;
 
 export class DocManager {
@@ -68,7 +73,7 @@ export class DocManager {
 		if (!l) {
 			const doc = new Y.Doc();
 			const session = this.newSession(docId, doc, opts);
-			const entry: Live = { session, refs: 0, persistTimer: null, releaseTimer: null, loaded: Promise.resolve(), loading: false, quiet: 0 };
+			const entry: Live = { session, refs: 0, persistTimer: null, releaseTimer: null, loaded: Promise.resolve(), loading: false, quiet: 0, encodeMs: 0 };
 			entry.loaded = this.store.get(docName(this.space, docId)).then((rec) => {
 				if (rec?.state?.length) {
 					entry.loading = true;
@@ -219,7 +224,8 @@ export class DocManager {
 		if (this.destroyed) return;
 		const l = this.live.get(docId);
 		if (!l || l.persistTimer !== null) return;
-		l.persistTimer = window.setTimeout(() => void this.persistNow(docId, l), PERSIST_DELAY);
+		const delay = Math.min(PERSIST_MAX_DELAY, Math.max(PERSIST_DELAY, l.encodeMs * PERSIST_COST_FACTOR));
+		l.persistTimer = window.setTimeout(() => void this.persistNow(docId, l), delay);
 	}
 
 	private async persistNow(docId: string, l: Live) {
@@ -227,13 +233,21 @@ export class DocManager {
 		l.persistTimer = null;
 		await l.loaded;
 		if (this.destroyed) return;
+		const t0 = performance.now();
+		const state = Y.encodeStateAsUpdate(l.session.doc);
+		l.encodeMs = performance.now() - t0;
 		await this.store.put({
 			name: docName(this.space, docId),
-			state: Y.encodeStateAsUpdate(l.session.doc),
+			state,
 			base: l.base,
 			edited: l.edited,
 			e2ee: l.session.e2eeState(),
 		});
+	}
+
+	/** Alles, was auf das Speichern wartet, sofort speichern (App geht in den Hintergrund). */
+	async flushAllPersists() {
+		await Promise.all([...this.live].filter(([, l]) => l.persistTimer !== null).map(([id, l]) => this.persistNow(id, l).catch(() => {})));
 	}
 
 	/** Ausstehendes Speichern sofort erledigen (falls das Doc gerade geladen ist). */

@@ -62,6 +62,35 @@ describe("DocManager", () => {
 		vi.useRealTimers();
 	});
 
+	it("speichert Docs, deren Kodieren lange dauert, seltener (höchstens alle 4 s)", async () => {
+		vi.useFakeTimers();
+		const store = memStore({ "s/x": stored("Hallo") });
+		const dm = new DocManager(fakeConn("offline") as never, store as never, "s");
+		const s = await dm.acquire("x");
+		const text = s.doc.getText("content");
+		text.insert(0, "a");
+		await vi.advanceTimersByTimeAsync(400);
+		expect(store.puts.length).toBe(1);
+		// Kodieren „dauert“ ab jetzt 100 ms → nächstes Speichern frühestens nach 2,5 s
+		let t = 0;
+		const now = vi.spyOn(performance, "now").mockImplementation(() => (t += 100));
+		text.insert(0, "b");
+		await vi.advanceTimersByTimeAsync(400);
+		expect(store.puts.length).toBe(2);
+		text.insert(0, "c");
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(store.puts.length).toBe(2);
+		await vi.advanceTimersByTimeAsync(600);
+		expect(store.puts.length).toBe(3);
+		// Beim Wechsel in den Hintergrund sofort
+		text.insert(0, "d");
+		await dm.flushAllPersists();
+		expect(store.puts.length).toBe(4);
+		now.mockRestore();
+		await dm.destroy();
+		vi.useRealTimers();
+	});
+
 	it("Laden meldet onRemoteUpdate – außer während eines Abgleichs (withDoc mit reconciles)", async () => {
 		const store = memStore({ "s/x": stored("Hallo") });
 		const conn = fakeConn("offline");
