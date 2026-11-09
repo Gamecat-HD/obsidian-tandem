@@ -68,9 +68,11 @@ Die Routen des Plugins (`/api/invite`, `/api/members`, `/api/e2ee`, `/api/blob`,
 - `md`/`text`: `Y.Text("content")`
 - `ink`: `Y.Map("meta")` (`head` = JSON-Kopf der .ink-Datei ohne `strokes`), `Y.Map("strokes")` (`id → Strich-JSON-Zeile`), `Y.Array("order")` (Stroke-IDs)
 - `blob`: kein Doc, Inhalt über HTTP nach `hash`.
-- Alle Docs außer `_index` (ab Plugin 0.8.0): Autorenschaft für Blame (`plugin/src/blame/authorship.ts`)
-  - `Y.Map("tandem:authors")`: `clientID (als Text) → {id, name, color, device?}`, einmal pro Doc-Instanz beim ersten Schreiben
-  - `Y.Array("tandem:marks")`: `[clientID, clock, Zeit in ms, Quelle (0 = Editor, 1 = Datei von außen)]`, höchstens eine Marke pro Minute und Instanz. Ein Zeichen `(client, clock)` gilt als zur Zeit der letzten Marke mit gleicher clientID und `clock ≤` geschrieben.
+- Alle Docs außer `_index` (ab Plugin 0.9.0): Autorenschaft für Blame (`plugin/src/blame/authorship.ts`)
+  - `Y.Map("tandem:p")`: `Personen-ID → [Name, Farbe]`
+  - `Y.Map("tandem:a")`: `clientID (als Text) → [Personen-ID, Gerät?]`, einmal pro Doc-Instanz beim ersten Schreiben
+  - `Y.Array("tandem:t")`: `[clock, Sekunden seit 2026-01-01, Quelle?]` (Quelle 1 = Datei von außen, fehlt = Editor). Die clientID ist die Yjs-ID des Array-Elements selbst. Neue Marke nach ≥ 2 min Pause, spätestens alle 10 min, bei Quellwechsel und (frühestens alle 3 s) nach fremden Änderungen – dann mindestens 1 s nach der jüngsten bekannten Marke (logische Uhr). Ein Zeichen bzw. Ink-Strich `(client, clock)` gilt als zur Zeit der letzten Marke mit gleicher clientID und `clock ≤` geschrieben.
+  - Plugin 0.8.0 schrieb `Y.Map("tandem:authors")` (`clientID → {id, name, color, device?}`) und `Y.Array("tandem:marks")` (`[clientID, clock, ms, Quelle]`); wird weiter gelesen.
 
 ## Awareness-Zustand
 
