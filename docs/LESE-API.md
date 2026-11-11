@@ -8,14 +8,12 @@ Nicht Teil der Schnittstelle ist das WebSocket-Protokoll (`/ws`, [PROTOKOLL.md](
 
 ## Zugang
 
-Für den Zugang braucht man einen Geräte-Token mit mindestens Leserecht im Space und schickt ihn als `Authorization: Bearer <token>` mit. Das Recht hängt an der Person, nicht am Token. So kommt man zum Token:
+Für den Zugang braucht man einen Token und schickt ihn als `Authorization: Bearer <token>` mit. So kommt man dazu:
 
-1. Im Admin eine eigene Person für den Dienst anlegen, z. B. `lernplattform`. Dann sieht man in der Geräteliste, wer liest, und kann den Dienst allein sperren.
-2. Die Person dem Vault mit der Rolle „Lesen“ zuweisen.
-3. Bei der Person „Einladen“ wählen, am besten gleich mit dem Vault. Der Code gilt einmal.
-4. Den Code einlösen: `POST /api/redeem` mit `{ "code": "…", "device": "<Name des Dienstes>" }`. Die Antwort enthält `token`.
+1. Im Admin unter „Schnittstellen“ einen Dienst anlegen, z. B. `lernplattform`, und die Vaults auswählen, die er lesen darf.
+2. Den angezeigten Token in den Dienst eintragen. Er ist nur in diesem Moment sichtbar; „Token neu erzeugen“ stellt einen neuen aus und sperrt den alten.
 
-Ohne Vault in der Einladung gilt der Token für alle Vaults der Person, bis man ihn im Admin unter „Geräte“ einem Vault zuordnet. Gesperrt wird ein Token ebenfalls dort; ein offener Änderungs-Feed endet dann spätestens nach einer Minute.
+Ein Dienst darf nur lesen und nicht über den WebSocket verbinden. Dort sieht man auch, ob sein Änderungs-Feed verbunden ist und wann er zuletzt gelesen hat, und kann ihn sperren. Ein gesperrter Token beendet einen offenen Feed spätestens nach einer Minute. Wer einen Dienst noch als Person mit Einladung angelegt hat (vor 0.10), übernimmt ihn im Menü der Person mit „Als Schnittstelle übernehmen“; der Token bleibt dabei gleich.
 
 | Status | Bedeutung |
 |---|---|

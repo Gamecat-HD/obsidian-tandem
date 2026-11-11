@@ -1,5 +1,10 @@
 # Änderungen
 
+## 0.10.0
+
+Das Plugin ändert sich nur in der Versionsnummer. Es muss trotzdem aktualisiert werden, weil Plugin und Server dieselbe Version haben müssen.
+
+- **Schnittstellen im Admin:** Dienste der [Lese-API](docs/LESE-API.md) (z. B. die Lernplattform) haben eine eigene Ansicht und stehen nicht mehr zwischen Personen und Geräten. Anlegen mit Name und Vaults, der Token erscheint direkt (ohne Einladung und `curl`), dazu „Token neu erzeugen“, Sperren, Vault-Zugriff und der Zustand: Feed verbunden oder zuletzt gelesen. Dienste dürfen nur lesen, bekommen keine Einladungen und werden am WebSocket abgewiesen. Eine bisher als Person angelegte Schnittstelle übernimmt man im Menü der Person mit „Als Schnittstelle übernehmen“, ihr Token bleibt dabei gleich.
 ## 0.9.1
 
 Das Plugin ändert sich nur in der Versionsnummer. Es muss trotzdem aktualisiert werden, weil Plugin und Server seit 0.8.2 dieselbe Version haben müssen.

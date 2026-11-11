@@ -107,6 +107,11 @@ impl Store {
         if !has_token_space {
             conn.execute_batch("ALTER TABLE tokens ADD COLUMN space TEXT; ALTER TABLE invites ADD COLUMN space TEXT;")?;
         }
+        // Migration 0.10: Dienste (Lese-API) sind Personen mit service = 1 – nur Lesen, kein WebSocket.
+        let has_service: bool = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'service'", [], |r| r.get::<_, i64>(0))? > 0;
+        if !has_service {
+            conn.execute_batch("ALTER TABLE users ADD COLUMN service INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(Self { conn })
     }
 
@@ -139,6 +144,41 @@ impl Store {
         Ok(v)
     }
 
+    /// Dienste (Lese-API-Zugänge) statt Personen.
+    pub fn services(&self) -> Result<Vec<User>> {
+        let mut st = self.conn.prepare("SELECT id, name, color FROM users WHERE service = 1 ORDER BY id")?;
+        let v = st.query_map([], |r| Ok(User { id: r.get(0)?, name: r.get(1)?, color: r.get(2)? }))?.collect::<Result<_, _>>()?;
+        Ok(v)
+    }
+
+    pub fn is_service(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT service FROM users WHERE id = ?1", [id], |r| r.get::<_, i64>(0)).optional()? == Some(1))
+    }
+
+    /// Person zum Dienst machen: alle Rollen werden „Lesen“, Tokens bleiben gültig.
+    pub fn make_service(&self, id: &str) -> Result<()> {
+        if self.conn.execute("UPDATE users SET service = 1 WHERE id = ?1", [id])? == 0 {
+            bail!("Nutzer {id} nicht gefunden");
+        }
+        self.conn.execute("UPDATE members SET role = 'read' WHERE user_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM invites WHERE user_id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Neuen Token für einen Dienst ausstellen und alle bisherigen sperren. Liefert die vollen Hashes der gesperrten.
+    pub fn replace_token(&mut self, user: &str, device: &str) -> Result<(String, Vec<String>)> {
+        let tx = self.conn.transaction()?;
+        let old: Vec<String> = {
+            let mut st = tx.prepare("SELECT hash FROM tokens WHERE user_id = ?1 AND revoked = 0")?;
+            st.query_map([user], |r| r.get(0))?.collect::<Result<_, _>>()?
+        };
+        tx.execute("UPDATE tokens SET revoked = 1 WHERE user_id = ?1", [user])?;
+        let token = random_token(32);
+        tx.execute("INSERT INTO tokens (hash, user_id, device, created) VALUES (?1, ?2, ?3, ?4)", params![sha256_hex(token.as_bytes()), user, device, now()])?;
+        tx.commit()?;
+        Ok((token, old))
+    }
+
     pub fn delete_user(&self, id: &str) -> Result<()> {
         if self.conn.execute("DELETE FROM users WHERE id = ?1", [id])? == 0 {
             bail!("Nutzer {id} nicht gefunden");
@@ -159,6 +199,9 @@ impl Store {
     pub fn set_member(&self, space: &str, user: &str, role: &str) -> Result<()> {
         if !matches!(role, "owner" | "write" | "read") {
             bail!("Rolle muss owner, write oder read sein");
+        }
+        if role != "read" && self.is_service(user)? {
+            bail!("Dienste können nur lesen");
         }
         self.conn.execute(
             "INSERT INTO members (space, user_id, role) VALUES (?1, ?2, ?3) ON CONFLICT(space, user_id) DO UPDATE SET role = excluded.role",
@@ -513,17 +556,17 @@ impl Store {
     /// Mitglieder eines Space mit ihren (nicht gesperrten) Geräten dieses Space.
     pub fn members(&self, space: &str) -> Result<Vec<serde_json::Value>> {
         let mut st = self.conn.prepare(
-            "SELECT u.id, u.name, u.color, m.role FROM members m JOIN users u ON u.id = m.user_id WHERE m.space = ?1 ORDER BY u.name",
+            "SELECT u.id, u.name, u.color, m.role, u.service FROM members m JOIN users u ON u.id = m.user_id WHERE m.space = ?1 ORDER BY u.name",
         )?;
-        let rows: Vec<(String, String, String, String)> =
-            st.query_map([space], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+        let rows: Vec<(String, String, String, String, i64)> =
+            st.query_map([space], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<_, _>>()?;
         let mut dev = self.conn.prepare("SELECT device, last_seen FROM tokens WHERE user_id = ?1 AND revoked = 0 AND (space IS NULL OR space = ?2) ORDER BY created")?;
         let mut out = Vec::new();
-        for (id, name, color, role) in rows {
+        for (id, name, color, role, service) in rows {
             let devices: Vec<serde_json::Value> = dev
                 .query_map(params![&id, space], |r| Ok(serde_json::json!({ "device": r.get::<_, String>(0)?, "lastSeen": r.get::<_, Option<i64>>(1)? })))?
                 .collect::<Result<_, _>>()?;
-            out.push(serde_json::json!({ "id": id, "name": name, "color": color, "role": role, "devices": devices }));
+            out.push(serde_json::json!({ "id": id, "name": name, "color": color, "role": role, "service": service == 1, "devices": devices }));
         }
         Ok(out)
     }
@@ -1120,6 +1163,24 @@ mod tests {
         drop(s);
         Store::open(&path).unwrap(); // zweites Öffnen migriert nicht erneut
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn service_keeps_token_and_only_reads() {
+        let mut s = mem();
+        s.add_space("schule", "Schule").unwrap();
+        s.add_user("lp", "Lernplattform", None).unwrap();
+        s.set_member("schule", "lp", "write").unwrap();
+        let old = s.issue_token("lp", "lernplattform").unwrap();
+        s.make_service("lp").unwrap();
+        assert!(s.auth(&old).unwrap().is_some(), "Übernehmen behält den Token");
+        assert_eq!(s.role("schule", "lp").unwrap().as_deref(), Some("read"));
+        assert!(s.set_member("schule", "lp", "owner").is_err());
+        assert_eq!(s.services().unwrap().len(), 1);
+        let (new, revoked) = s.replace_token("lp", "Lernplattform").unwrap();
+        assert_eq!(revoked.len(), 1);
+        assert!(s.auth(&old).unwrap().is_none());
+        assert!(s.auth(&new).unwrap().is_some());
     }
 
     #[test]

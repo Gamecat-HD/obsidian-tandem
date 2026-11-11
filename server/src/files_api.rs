@@ -230,7 +230,30 @@ fn catchup(app: &App, space: &str, since: u64) -> Result<(u64, Vec<Event>), Stri
     Ok((seq, events))
 }
 
+/// Zählt einen offenen Feed in `App::feeds`, solange er lebt.
+struct Open(App, String);
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        let mut m = self.0.feeds.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.1);
+            }
+        }
+    }
+}
+
+impl Open {
+    fn new(app: &App, user: &str) -> Self {
+        *app.feeds.lock().unwrap_or_else(|e| e.into_inner()).entry(user.to_string()).or_default() += 1;
+        Self(app.clone(), user.to_string())
+    }
+}
+
 struct Feed {
+    _open: Open,
     app: App,
     headers: HeaderMap,
     space: String,
@@ -288,9 +311,10 @@ pub async fn changes(State(app): State<App>, h: HeaderMap, Path(space): Path<Str
     if !codec::valid_id(&space) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if let Err(c) = require_role(&app, &h, &space, false) {
-        return c.into_response();
-    }
+    let user = match require_role(&app, &h, &space, false) {
+        Ok(u) => u,
+        Err(c) => return c.into_response(),
+    };
     let e2ee = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).space_e2ee(&space);
     if matches!(e2ee, Ok(Some(_))) {
         return (StatusCode::CONFLICT, "Vault ist Ende-zu-Ende-verschlüsselt").into_response();
@@ -303,7 +327,7 @@ pub async fn changes(State(app): State<App>, h: HeaderMap, Path(space): Path<Str
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
     let closing = app.hub.closing.subscribe();
-    let feed = Feed { app, headers: h, space, rx, seq, queue: events.into(), checked: Instant::now(), closing };
+    let feed = Feed { _open: Open::new(&app, &user.id), app, headers: h, space, rx, seq, queue: events.into(), checked: Instant::now(), closing };
     let stream = futures_util::stream::unfold(feed, |mut f| async move { f.next().await.map(|e| (Ok::<_, Infallible>(e), f)) });
     let mut res = Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(25))).into_response();
     // nginx (Reverse-Proxy) puffert sonst den Strom

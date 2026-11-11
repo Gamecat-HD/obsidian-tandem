@@ -1,7 +1,7 @@
 {
 	"id": "tandem",
 	"name": "Tandem",
-	"version": "0.9.1",
+	"version": "0.10.0",
 	"minAppVersion": "1.5.0",
 	"description": "Echtzeit-Zusammenarbeit und Vault-Sync mit eigenem Server: Live-Cursor, Präsenz, Ink-Blocks-Striche live.",
 	"author": "Gamecat-HD",

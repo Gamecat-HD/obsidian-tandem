@@ -99,6 +99,9 @@ pub fn router() -> Router<App> {
         .route("/users", get(users).post(user_add))
         .route("/users/{id}", axum::routing::patch(user_patch).delete(user_delete))
         .route("/users/{id}/invite", post(user_invite))
+        .route("/users/{id}/service", post(user_to_service))
+        .route("/services", get(services).post(service_add))
+        .route("/services/{id}/token", post(service_token))
         .route("/devices/{id}/revoke", post(device_revoke))
         .route("/devices/{id}/unrevoke", post(device_unrevoke))
         .route("/devices/{id}/space", post(device_assign))
@@ -814,8 +817,9 @@ async fn users(State(app): State<App>, h: HeaderMap) -> R {
     let online: Vec<Value> = app.hub.online(None);
     let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
     let admins: Vec<String> = st.admins()?.into_iter().map(|a| a.0).collect();
+    let services: Vec<String> = st.services()?.into_iter().map(|u| u.id).collect();
     let mut out = Vec::new();
-    for u in st.users()? {
+    for u in st.users()?.into_iter().filter(|u| !services.contains(&u.id)) {
         let mut devices = st.devices(&u.id)?;
         for d in &mut devices {
             let o = online.iter().find(|o| o["token"] == d["id"]);
@@ -909,7 +913,13 @@ struct InviteReq {
 async fn user_invite(State(app): State<App>, h: HeaderMap, Path(id): Path<String>, Json(req): Json<InviteReq>) -> R {
     let c = ctx(&app, &h)?;
     let hours = req.hours.unwrap_or(72).clamp(1, 24 * 30);
-    let code = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).create_invite(&id, hours, req.space.as_deref())?;
+    let code = {
+        let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
+        if st.is_service(&id)? {
+            return Err(bad("Dienste bekommen keine Einladung – Token unter „Schnittstellen“ neu erzeugen"));
+        }
+        st.create_invite(&id, hours, req.space.as_deref())?
+    };
     audit(&app, &c, "invite", format!("{id}, {hours} h{}", req.space.as_deref().map(|s| format!(", {s}")).unwrap_or_default()));
     Ok(Json(json!({ "code": code, "hours": hours, "space": req.space })).into_response())
 }
@@ -978,6 +988,86 @@ async fn devices_cleanup(State(app): State<App>, h: HeaderMap, Json(req): Json<C
     }
     audit(&app, &c, "device.cleanup", format!("{} entfernt ({}; verbundene ausgenommen)", gone.len(), what.join(", ")));
     Ok(Json(json!({ "removed": gone.len() })).into_response())
+}
+
+// ── Schnittstellen (Dienste der Lese-API) ────────────────────────────
+
+/// Dienste mit Vaults, Tokens (Kennung, zuletzt gelesen, gesperrt) und Zahl offener Änderungs-Feeds.
+async fn services(State(app): State<App>, h: HeaderMap) -> R {
+    ctx(&app, &h)?;
+    let feeds = app.feeds.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for u in st.services()? {
+        out.push(json!({ "id": u.id, "name": u.name, "color": u.color, "spaces": st.spaces_of(&u.id)?,
+            "tokens": st.devices(&u.id)?, "feeds": feeds.get(&u.id).copied().unwrap_or(0) }));
+    }
+    Ok(Json(out).into_response())
+}
+
+#[derive(Deserialize)]
+struct ServiceAdd {
+    id: String,
+    name: String,
+    #[serde(default)]
+    spaces: Vec<String>,
+}
+
+/// Dienst anlegen, Vaults mit „Lesen“ zuweisen und den Token einmalig zurückgeben.
+async fn service_add(State(app): State<App>, h: HeaderMap, Json(req): Json<ServiceAdd>) -> R {
+    let c = ctx(&app, &h)?;
+    let id = req.id.trim().to_lowercase();
+    let name = clean_name(&req.name)?;
+    for s in &req.spaces {
+        check_space(&app, s)?;
+    }
+    let token = {
+        let mut st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
+        if st.user(&id)?.is_some() {
+            return Err(conflict(format!("Die Kennung „{id}“ ist schon vergeben")));
+        }
+        st.add_user(&id, &name, None).map_err(|_| bad("Kennung: nur a-z, 0-9, _ und - (max. 64 Zeichen)"))?;
+        st.make_service(&id)?;
+        for s in &req.spaces {
+            st.set_member(s, &id, "read")?;
+        }
+        st.replace_token(&id, &name)?.0
+    };
+    audit(&app, &c, "service.add", format!("{id} ({})", req.spaces.join(", ")));
+    Ok(Json(json!({ "id": id, "token": token })).into_response())
+}
+
+/// Neuen Token ausstellen, alle alten sperren (offene Feeds enden spätestens nach einer Minute).
+async fn service_token(State(app): State<App>, h: HeaderMap, Path(id): Path<String>) -> R {
+    let c = ctx(&app, &h)?;
+    let token = {
+        let mut st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
+        let u = st.user(&id)?.ok_or_else(|| not_found("Dienst nicht gefunden"))?;
+        if !st.is_service(&id)? {
+            return Err(bad("Keine Schnittstelle"));
+        }
+        st.replace_token(&id, &u.name)?.0
+    };
+    audit(&app, &c, "service.token", &id);
+    Ok(Json(json!({ "token": token })).into_response())
+}
+
+/// Bestehende Person (z. B. die alte Lernplattform-Person) als Dienst übernehmen – Tokens bleiben gültig.
+async fn user_to_service(State(app): State<App>, h: HeaderMap, Path(id): Path<String>) -> R {
+    let c = ctx(&app, &h)?;
+    if id == c.user.id {
+        return Err(bad("Das eigene Konto kann kein Dienst werden"));
+    }
+    {
+        let st = app.hub.store.lock().unwrap_or_else(|e| e.into_inner());
+        if st.admins()?.iter().any(|a| a.0 == id) {
+            return Err(bad("Admins können keine Dienste sein"));
+        }
+        st.make_service(&id)?;
+    }
+    let n = app.hub.kick_where(|k| k.user.id == id);
+    audit(&app, &c, "service.adopt", format!("{id} ({n} Verbindungen getrennt)"));
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[derive(Deserialize)]
@@ -1093,7 +1183,7 @@ async fn spaces(State(app): State<App>, h: HeaderMap) -> R {
         let members: Vec<Value> = st
             .members(&id)?
             .into_iter()
-            .map(|m| json!({ "id": m["id"], "name": m["name"], "color": m["color"], "role": m["role"] }))
+            .map(|m| json!({ "id": m["id"], "name": m["name"], "color": m["color"], "role": m["role"], "service": m["service"] }))
             .collect();
         let e2ee = match st.space_e2ee(&id)?.as_deref() {
             None => "off",

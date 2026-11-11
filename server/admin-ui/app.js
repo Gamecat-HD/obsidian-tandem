@@ -1071,6 +1071,7 @@ const routes = [
   [/^#\/vaults\/?$/, 'vaults', () => viewVaults()],
   [/^#\/vault\/([^/?]+)(?:\/([^/?]*))?\/?$/, 'vaults', (m) => viewVault(dec(m[1]), m[2] ? dec(m[2]) : '')],
   [/^#\/users(?:\/([^/?]+))?\/?$/, 'users', (m) => viewUsers(m[1] ? dec(m[1]) : null)],
+  [/^#\/services(?:\/([^/?]+))?\/?$/, 'services', (m) => viewServices(m[1] ? dec(m[1]) : null)],
   [/^#\/backups\/?$/, 'backups', () => viewBackups()],
   [/^#\/backups\/([^/?]+)(?:\/([^/?]+))?(?:\/([^/?]+))?\/?$/, 'backups', (m) => viewBackup(dec(m[1]), m[2] ? dec(m[2]) : null, m[3] ? dec(m[3]) : null)],
   [/^#\/stats\/?$/, 'stats', () => viewStats()],
@@ -1685,6 +1686,7 @@ function personEl(u, spaces, reload) {
     menuButton(`Weitere Aktionen für ${who}`, () => [
       { label: 'Bearbeiten …', onClick: async () => { if (await userDialog(u, spaces)) { toast('Gespeichert', 'ok'); await reload('person:' + u.id); } } },
       { label: 'Protokoll dieser Person', onClick: () => navigate(`#/audit?user=${enc(u.id)}`) },
+      isMe || u.admin ? null : { label: 'Als Schnittstelle übernehmen …', onClick: () => adoptService(u) },
       isMe ? null : '-',
       isMe ? null : { label: 'Person löschen …', danger: true, onClick: () => deletePerson(u, devices, memberships, reload) },
     ]));
@@ -2070,6 +2072,272 @@ async function cleanupDialog(users) {
 }
 
 // ---------------------------------------------------------------------------
+// Schnittstellen: Dienste der Lese-API (nur Lesen, Zugang per Token, kein Obsidian)
+
+const servicesUi = { open: new Set() };
+const E2EE_NO_API = 'Ende-zu-Ende-verschlüsselt – die Lese-API liefert für diesen Vault nichts (409).';
+
+async function viewServices(focusId) {
+  const list = h('div', { class: 'people' });
+  const box = h('div');
+  let services = [], spaces = [];
+  if (focusId) servicesUi.open.add(focusId);
+
+  const load = loader(box, async () => {
+    const [r, sp] = await Promise.all([api('services', { quiet: true }), loadSpaces()]);
+    services = (Array.isArray(r) ? r : []).sort((a, b) => coll.compare(a.name || a.id, b.name || b.id));
+    spaces = sp;
+    clear(list);
+    if (!services.length) list.append(emptyEl('Noch keine Schnittstellen.'));
+    for (const s of services) list.append(serviceEl(s, spaces, reload));
+    return h('div', { class: 'card' }, list);
+  }, { what: 'Die Liste der Schnittstellen' });
+
+  async function reload(key) {
+    await load();
+    if (key) refocus(list, key, main.querySelector('h1'));
+  }
+
+  const createBtn = h('button', { class: 'btn primary', type: 'button', text: 'Neue Schnittstelle' });
+  createBtn.addEventListener('click', async () => {
+    const r = await serviceDialog(spaces, services);
+    if (!r) return;
+    servicesUi.open.add(r.id);
+    await reload('person:' + r.id);
+    const el = list.querySelector(`[data-key="person:${CSS.escape(r.id)}"]`);
+    if (el) { el.closest('.person').classList.add('fresh'); el.scrollIntoView({ block: 'center' }); }
+    await tokenDialog(r.name, r.token, r.spaces[0]);
+  });
+  page('Schnittstellen', frag(refreshButton(() => reload()), createBtn),
+    h('p', { class: 'dim small' }, 'Dienste, die Vaults über die Lese-API abrufen: nur Lesen, Zugang per Token.'), box);
+  await load();
+  if (focusId) {
+    const el = list.querySelector(`[data-key="person:${CSS.escape(focusId)}"]`);
+    if (el) { el.scrollIntoView({ block: 'start' }); el.focus({ preventScroll: true }); }
+  }
+}
+
+function serviceEl(s, spaces, reload) {
+  const tokens = Array.isArray(s.tokens) ? s.tokens : [];
+  const memberships = Array.isArray(s.spaces) ? s.spaces : [];
+  const who = esc(s.name || s.id);
+  const key = 'person:' + s.id;
+  const active = tokens.filter((t) => !t.revoked);
+  const lastSeen = active.reduce((m, t) => Math.max(m, Number(t.lastSeen) || 0), 0);
+  const open = servicesUi.open.has(s.id);
+  const detailsId = nextId('service');
+
+  const toggle = h('button', { class: 'person-toggle', type: 'button', 'aria-expanded': String(open), 'aria-controls': detailsId, dataset: { key } },
+    h('span', { class: 'chev', 'aria-hidden': 'true', text: '▸' }),
+    avatar(s),
+    h('span', { class: 'pw' }, h('span', { class: 'name', text: who }), s.name && s.name.toLowerCase() !== s.id ? h('span', { class: 'dim id', text: esc(s.id) }) : null));
+  const status = !tokens.length ? h('span', { class: 'warn-text small', text: 'kein Token' })
+    : !active.length ? h('span', { class: 'badge', text: 'gesperrt' })
+    : s.feeds > 0 ? h('span', { class: 'ok-text small', title: plural(s.feeds, 'offener Änderungs-Feed', 'offene Änderungs-Feeds') }, colorDot(null, 'online'), 'Feed verbunden')
+    : lastSeen ? h('span', { class: 'dim small' }, 'zuletzt gelesen ', timeEl(lastSeen))
+    : h('span', { class: 'dim small', text: 'noch nie gelesen' });
+  const summary = h('div', { class: 'person-sum' },
+    memberships.length ? memberChips(memberships.map((m) => ({ id: m.id, name: m.name || m.id })), 3) : h('span', { class: 'warn-text small', text: 'kein Vault' }),
+    status);
+
+  const details = h('div', { class: 'person-details', id: detailsId, hidden: !open });
+  const build = () => { if (!details.firstChild) details.append(serviceDetails(s, spaces, reload, { who, tokens, memberships })); };
+  if (open) build();
+  toggle.addEventListener('click', () => {
+    const now = toggle.getAttribute('aria-expanded') !== 'true';
+    toggle.setAttribute('aria-expanded', String(now));
+    if (now) { build(); servicesUi.open.add(s.id); } else servicesUi.open.delete(s.id);
+    details.hidden = !now;
+  });
+
+  const newToken = async () => {
+    const ok = await confirmDialog('Token neu erzeugen', h('p', {}, h('strong', { text: who }), ' bekommt einen neuen Token. Alle bisherigen werden gesperrt; offene Feeds enden spätestens nach einer Minute.'), { okLabel: 'Neu erzeugen', danger: true });
+    if (!ok) return;
+    const r = await api(`services/${enc(s.id)}/token`, { method: 'POST' });
+    await reload(key);
+    await tokenDialog(who, r.token, memberships.length ? memberships[0].id : null);
+  };
+  // Sperren trifft alle aktiven Tokens; aufheben nur den jüngsten (ältere hat „neu erzeugen“ abgelöst)
+  const setRevoked = async (list, verb, msg) => {
+    for (const t of list) await api(`devices/${enc(t.id)}/${verb}`, { method: 'POST' });
+    toast(`${who} ${msg}`, 'ok');
+    await reload(key);
+  };
+  const actions = h('div', { class: 'person-actions' },
+    menuButton(`Aktionen für ${who}`, () => [
+      { label: 'Umbenennen …', onClick: async () => {
+        const v = await promptDialog('Schnittstelle umbenennen', { label: 'Name', value: s.name || '', okLabel: 'Speichern', submit: (name) => api(`users/${enc(s.id)}`, { method: 'PATCH', body: { name }, quiet: true }) });
+        if (v) { toast('Gespeichert', 'ok'); await reload(key); }
+      } },
+      { label: 'Token neu erzeugen …', onClick: newToken },
+      active.length ? { label: 'Sperren', onClick: () => setRevoked(active, 'revoke', 'ist gesperrt') }
+        : tokens.length ? { label: 'Sperre aufheben', onClick: () => setRevoked(tokens.slice(-1), 'unrevoke', 'kann wieder lesen') } : null,
+      { label: 'Protokoll', onClick: () => navigate(`#/audit?user=${enc(s.id)}`) },
+      '-',
+      { label: 'Schnittstelle löschen …', danger: true, onClick: async () => {
+        const ok = await confirmDialog('Schnittstelle löschen', h('p', {}, h('strong', { text: who }), ' wird gelöscht, der Token ist sofort ungültig.'), { okLabel: 'Löschen', danger: true });
+        if (!ok) return;
+        await api(`users/${enc(s.id)}`, { method: 'DELETE' });
+        servicesUi.open.delete(s.id);
+        toast('Schnittstelle gelöscht', 'ok');
+        await reload();
+      } },
+    ]));
+
+  return h('section', { class: 'person', 'aria-label': who },
+    h('div', { class: 'person-head' }, toggle, summary, actions),
+    details);
+}
+
+function serviceDetails(s, spaces, reload, { who, tokens, memberships }) {
+  const memberIds = new Set(memberships.map((m) => m.id));
+  const vaultRows = memberships.map((m) => {
+    const sname = esc(m.name || m.id);
+    const rm = h('button', { class: 'btn sm', type: 'button', text: 'Entfernen', 'aria-label': `${who} aus ${sname} entfernen` });
+    rm.addEventListener('click', async () => {
+      const ok = await confirmDialog('Zugriff entziehen', `${who} kann „${sname}“ nicht mehr lesen.`, { okLabel: 'Zugriff entziehen', danger: true });
+      if (!ok) return;
+      await busy(rm, async () => { await removeMember(m.id, s.id); toast(`${who} aus „${sname}“ entfernt`, 'ok'); await reload('add:' + s.id); });
+    });
+    const st = e2eeOf(m) !== 'off' ? e2eeOf(m) : spaceE2ee(m.id);
+    return h('tr', {},
+      h('td', {}, h('a', { class: 'row-link', href: `#/vault/${enc(m.id)}` }, nameWithId(m.name || m.id, m.id)),
+        st !== 'off' ? h('span', { class: 'badge warn', title: E2EE_NO_API, text: 'verschlüsselt – nicht lesbar' }) : null),
+      h('td', { class: 'actions' }, rm));
+  });
+  const rest = spaces.filter((x) => x && !memberIds.has(x.id));
+  const candidates = rest.filter((x) => e2eeOf(x) === 'off');
+  let addRow;
+  if (candidates.length) {
+    const addSel = h('select', { class: 'select', 'aria-label': 'Vault', dataset: { key: 'add:' + s.id } }, candidates.map((x) => h('option', { value: x.id, text: esc(x.name || x.id) })));
+    const addBtn = h('button', { class: 'btn sm', type: 'button', text: 'Hinzufügen' });
+    addBtn.addEventListener('click', () => busy(addBtn, async () => {
+      await setMember(addSel.value, s.id, 'read');
+      toast(`${who} kann jetzt „${esc(spaceName(addSel.value, spaces))}“ lesen`, 'ok');
+      await reload('add:' + s.id);
+    }));
+    addRow = h('div', { class: 'add-row' }, h('label', { class: 'lbl', text: 'Zugriff geben:' }), addSel, addBtn);
+  } else {
+    addRow = h('p', { class: 'dim small', dataset: { key: 'add:' + s.id }, tabindex: '-1' }, rest.length ? 'Die übrigen Vaults sind verschlüsselt – für die Lese-API nicht lesbar.' : spaces.length ? 'Liest alle Vaults.' : frag('Es gibt noch keinen Vault – unter ', h('a', { href: '#/vaults', text: 'Vaults' }), ' anlegen.'));
+  }
+  const vaultsSection = h('section', { class: 'person-section', 'aria-label': `Vaults von ${who}` },
+    h('h3', { text: `Vaults (${fmtNum(memberships.length)})` }),
+    memberships.length
+      ? table(['Vault', { text: '', class: 'actions' }], vaultRows, { cls: 'controls', cols: ['c-name', 'c-act'] })
+      : h('p', { class: 'warn-note', text: 'Noch kein Vault-Zugriff – der Token liefert nichts.' }),
+    addRow);
+
+  const tokenRow = (t) => {
+    const name = `Token ${esc(t.id)}`;
+    const key = 'dev:' + t.id;
+    const status = t.revoked ? h('span', { class: 'badge', text: 'gesperrt' })
+      : t.lastSeen == null ? h('span', { class: 'dim', text: 'noch nie benutzt' })
+      : h('span', { class: 'dim' }, 'zuletzt gelesen ', timeEl(t.lastSeen));
+    const flip = h('button', { class: 'btn sm', type: 'button', text: t.revoked ? 'Sperre aufheben' : 'Sperren', 'aria-label': `${name} ${t.revoked ? 'entsperren' : 'sperren'}`, dataset: { key } });
+    flip.addEventListener('click', () => busy(flip, async () => {
+      await api(`devices/${enc(t.id)}/${t.revoked ? 'unrevoke' : 'revoke'}`, { method: 'POST' });
+      toast(t.revoked ? `${name} gilt wieder` : `${name} gesperrt`, 'ok');
+      await reload(key);
+    }));
+    const del = h('button', { class: 'btn sm', type: 'button', text: 'Entfernen', 'aria-label': `${name} entfernen` });
+    del.addEventListener('click', async () => {
+      const ok = await confirmDialog('Token entfernen', `${name} von ${who} wird endgültig entfernt${t.revoked ? '' : ' und ist sofort ungültig'}.`, { okLabel: 'Entfernen', danger: true });
+      if (!ok) return;
+      await busy(del, async () => { await api(`devices/${enc(t.id)}`, { method: 'DELETE' }); toast(`${name} entfernt`, 'ok'); await reload('person:' + s.id); });
+    });
+    return h('li', { class: 'device' + (t.revoked ? ' revoked' : '') },
+      h('div', { class: 'main' },
+        h('span', { class: 'name' }, h('code', { text: esc(t.id) }), t.device && t.device !== s.name ? h('span', { class: 'dim', text: ' ' + esc(t.device) }) : null),
+        h('span', { class: 'small' }, status, h('span', { class: 'dim', text: ` · erzeugt ${dfShort.format(new Date(toMs(t.created) || Date.now()))}` }))),
+      h('div', { class: 'acts' }, flip, del));
+  };
+  const tokenSection = h('section', { class: 'person-section', 'aria-label': `Tokens von ${who}` },
+    h('h3', { text: `Tokens (${fmtNum(tokens.length)})` }),
+    tokens.length
+      ? h('ul', { class: 'devices' }, tokens.slice().sort((a, b) => (a.revoked - b.revoked) || (Number(b.created) || 0) - (Number(a.created) || 0)).map(tokenRow))
+      : h('p', { class: 'dim small', text: 'Kein Token – im Menü „Token neu erzeugen“.' }));
+
+  return h('div', { class: 'person-grid' }, vaultsSection, tokenSection);
+}
+
+// Neue Schnittstelle → { id, name, token, spaces } | null
+async function serviceDialog(spaces, services) {
+  const name = h('input', { class: 'input', id: 'sv-name', autocomplete: 'off', placeholder: 'z. B. Lernplattform', 'aria-describedby': 'sv-err' });
+  const id = h('input', { class: 'input mono', id: 'sv-id', autocomplete: 'off', spellcheck: 'false', placeholder: 'z. B. lernplattform', 'aria-describedby': 'sv-id-hint sv-err' });
+  const err = h('div', { class: 'form-error', id: 'sv-err', role: 'alert' });
+  let idTouched = false;
+  name.addEventListener('input', () => { if (!idTouched) id.value = slugify(name.value); err.textContent = ''; });
+  id.addEventListener('input', () => { idTouched = id.value !== ''; err.textContent = ''; });
+  const picks = spaces.map((s) => {
+    const locked = e2eeOf(s) !== 'off';
+    const cb = h('input', { type: 'checkbox', id: nextId('sv-v'), disabled: locked });
+    return { s, cb, el: h('div', { class: 'pick', title: locked ? E2EE_NO_API : null }, cb, h('label', { for: cb.id, text: esc(s.name || s.id) }), locked ? h('span', { class: 'dim small', text: 'verschlüsselt' }) : null) };
+  });
+  return openDialog({
+    title: 'Neue Schnittstelle',
+    body: frag(
+      h('div', { class: 'field' }, h('label', { for: 'sv-name', text: 'Name' }), name),
+      h('div', { class: 'field' }, h('label', { for: 'sv-id', text: 'Kennung' }), id, h('span', { class: 'hint', id: 'sv-id-hint', text: 'a–z, 0–9, _ und -; lässt sich später nicht ändern.' })),
+      h('fieldset', { class: 'field picks' },
+        h('legend', { text: 'Darf lesen' }),
+        picks.length ? picks.map((p) => p.el) : h('span', { class: 'hint', text: 'Noch kein Vault vorhanden – der Zugriff lässt sich später zuweisen.' }),
+        picks.some((p) => p.cb.disabled) ? h('span', { class: 'hint', text: 'Verschlüsselte Vaults kann die Lese-API nicht liefern.' }) : null),
+      err,
+    ),
+    buttons: [
+      { label: 'Abbrechen', value: null },
+      { label: 'Anlegen', kind: 'primary', onClick: async (close) => {
+        const i = id.value.trim(), n = name.value.trim();
+        const taken = `Die Kennung „${i}“ ist schon vergeben.`;
+        if (!n) { err.textContent = 'Name fehlt.'; name.focus(); return; }
+        if (!/^[a-z0-9_-]{1,64}$/.test(i)) { err.textContent = 'Kennung: nur a–z, 0–9, _ und -.'; id.focus(); return; }
+        if (services.some((x) => x.id === i)) { err.textContent = taken; id.focus(); return; }
+        const chosen = picks.filter((p) => p.cb.checked).map((p) => p.s.id);
+        try {
+          const r = await api('services', { method: 'POST', body: { id: i, name: n, spaces: chosen }, quiet: true });
+          close({ id: r.id, name: n, token: r.token, spaces: chosen });
+        } catch (ex) { err.textContent = ex.status === 409 ? taken : ex.message; }
+      } },
+    ],
+    onOpen: () => name.focus(),
+    cancelValue: null,
+  });
+}
+
+// Der Server kennt nur den Hash – der Token lässt sich später nicht noch einmal anzeigen
+function tokenDialog(who, token, space) {
+  const curl = `curl -H "Authorization: Bearer ${token}" ${location.origin}/api/files/${space || '<vault>'}`;
+  return openDialog({
+    title: `Token für ${who}`,
+    wide: true,
+    body: frag(
+      h('p', { class: 'warn-note', text: 'Der Token ist nur jetzt sichtbar. Jetzt kopieren und im Dienst hinterlegen.' }),
+      h('div', { class: 'code-big token', text: esc(token) }),
+      h('div', { class: 'field' }, h('span', { class: 'label', text: 'Beispiel' }), h('div', { class: 'cmd' }, h('code', { text: curl }))),
+    ),
+    buttons: [
+      { label: 'Beispiel kopieren', left: true, onClick: (_c, b) => copyText(curl, b) },
+      { label: 'Token kopieren', onClick: (_c, b) => copyText(token, b) },
+      { label: 'Fertig', kind: 'primary', value: true },
+    ],
+  });
+}
+
+async function adoptService(u) {
+  const who = esc(u.name || u.id);
+  const ok = await confirmDialog('Als Schnittstelle übernehmen', frag(
+    h('p', {}, h('strong', { text: who }), ' wird zur Schnittstelle der Lese-API.'),
+    h('ul', {}, h('li', { text: 'Die bestehenden Tokens bleiben gültig.' }), h('li', { text: 'In allen Vaults gilt nur noch „Lesen“.' }), h('li', { text: 'Verbinden aus Obsidian und Einladungen sind nicht mehr möglich; verbundene Geräte werden getrennt.' })),
+    h('p', { class: 'dim small', text: 'Das lässt sich hier nicht rückgängig machen.' })), { okLabel: 'Übernehmen', danger: true });
+  if (!ok) return;
+  await api(`users/${enc(u.id)}/service`, { method: 'POST' });
+  usersUi.open.delete(u.id);
+  state.users = null;
+  toast(`${who} ist jetzt eine Schnittstelle`, 'ok');
+  navigate(`#/services/${enc(u.id)}`);
+}
+
+// ---------------------------------------------------------------------------
 // Protokoll
 
 // Aktionen auf Deutsch, mit Kategorie (für Filter und Markierung)
@@ -2090,6 +2358,9 @@ const ACTION_LABELS = {
   'device.assign': ['Gerät einem Vault zugeordnet', 'people'],
   'device.delete': ['Gerät entfernt', 'people'],
   'device.cleanup': ['Geräte aufgeräumt', 'people'],
+  'service.add': ['Schnittstelle angelegt', 'people'],
+  'service.token': ['Token neu erzeugt', 'people'],
+  'service.adopt': ['Als Schnittstelle übernommen', 'people'],
   'space.add': ['Vault angelegt', 'vaults'],
   'space.rename': ['Vault umbenannt', 'vaults'],
   'space.delete': ['Vault gelöscht', 'vaults'],
@@ -2110,7 +2381,7 @@ const ACTION_LABELS = {
   'backup.restore': ['Aus Sicherung wiederhergestellt', 'backups'],
   'export': ['Vault exportiert', 'backups'],
 };
-const AUDIT_CATS = [['', 'Alle Bereiche', null], ['failed', 'Fehlgeschlagene Anmeldungen', ['login.failed']], ['security', 'Anmeldung & Sitzungen', ['login', 'logout', 'admin.', 'sessions.', 'passkey.']], ['people', 'Personen & Geräte', ['user.', 'invite', 'device.']], ['vaults', 'Vaults & Mitglieder', ['space.', 'member.']], ['files', 'Dateien', ['file.']], ['backups', 'Sicherungen', ['backup.', 'export']]];
+const AUDIT_CATS = [['', 'Alle Bereiche', null], ['failed', 'Fehlgeschlagene Anmeldungen', ['login.failed']], ['security', 'Anmeldung & Sitzungen', ['login', 'logout', 'admin.', 'sessions.', 'passkey.']], ['people', 'Personen, Geräte & Schnittstellen', ['user.', 'invite', 'device.', 'service.']], ['vaults', 'Vaults & Mitglieder', ['space.', 'member.']], ['files', 'Dateien', ['file.']], ['backups', 'Sicherungen', ['backup.', 'export']]];
 const AUDIT_PERIODS = [['', 'Gesamter Zeitraum', 0], ['1', 'Letzte 24 h', DAY], ['7', 'Letzte 7 Tage', 7 * DAY], ['30', 'Letzte 30 Tage', 30 * DAY]];
 
 // Details lesbar machen: Rollen übersetzen, Bytes formatieren, Nebensachen dimmen, Vault verlinken
@@ -3591,7 +3862,7 @@ function createVaultCtx(space) {
       const rm = h('button', { class: 'btn sm', type: 'button', text: 'Entfernen', 'aria-label': `${name} entfernen` });
       rm.addEventListener('click', async () => {
         const extra = consequence(m, true);
-        const ok = await confirmDialog('Zugriff entziehen', `${name} verliert den Zugriff auf diesen Vault, verbundene Geräte werden getrennt. Lokale Kopien bleiben auf den Geräten.${extra ? ' ' + extra : ''}`, { okLabel: 'Zugriff entziehen', danger: true });
+        const ok = await confirmDialog('Zugriff entziehen', m.service ? `${name} kann diesen Vault nicht mehr lesen.` : `${name} verliert den Zugriff auf diesen Vault, verbundene Geräte werden getrennt. Lokale Kopien bleiben auf den Geräten.${extra ? ' ' + extra : ''}`, { okLabel: 'Zugriff entziehen', danger: true });
         if (!ok) return;
         await busy(rm, async () => {
           await removeMember(space, m.id);
@@ -3604,10 +3875,11 @@ function createVaultCtx(space) {
       const n = onlineUsers.get(m.id) || 0;
       return h('tr', { dataset: { key: 'm:' + m.id } },
         h('td', {},
-          h('a', { class: 'plain-link', href: `#/users/${enc(m.id)}` }, colorDot(m.color), nameWithId(m.name || m.id, m.id)),
+          h('a', { class: 'plain-link', href: `#/${m.service ? 'services' : 'users'}/${enc(m.id)}` }, colorDot(m.color), nameWithId(m.name || m.id, m.id)),
+          m.service ? h('span', { class: 'badge', title: 'Dienst der Lese-API: nur Lesen, Zugang per Token', text: 'Schnittstelle' }) : null,
           m.id === meId ? h('span', { class: 'badge', text: 'du' }) : null,
           n ? h('span', { class: 'ok-text small', title: plural(n, 'Gerät verbunden', 'Geräte verbunden'), text: ' ● ' + plural(n, 'Gerät', 'Geräte') }) : null),
-        h('td', {}, sel),
+        h('td', {}, m.service ? roleLabel('read') : sel),
         h('td', { class: 'actions' }, rm));
     });
     const candidates = users.filter((u) => u && !memberIds.has(u.id)).sort((a, b) => coll.compare(a.name || a.id, b.name || b.id));

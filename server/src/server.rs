@@ -29,11 +29,13 @@ pub struct App {
     pub blob_dir: PathBuf,
     redeem_limit: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
     pub admin: Arc<crate::admin::AdminState>,
+    /// Offene Änderungs-Feeds (Lese-API) je Person/Dienst – für die Dienste-Ansicht im Admin
+    pub feeds: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl App {
     pub fn new(hub: Arc<Hub>, blob_dir: PathBuf) -> Self {
-        Self { hub, blob_dir, redeem_limit: Arc::default(), admin: Arc::new(crate::admin::AdminState::new()) }
+        Self { hub, blob_dir, redeem_limit: Arc::default(), admin: Arc::new(crate::admin::AdminState::new()), feeds: Arc::default() }
     }
 }
 
@@ -125,6 +127,11 @@ async fn handle_socket(socket: WebSocket, app: App) {
             }
             let u = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).auth(token).ok().flatten();
             match u {
+                Some((u, _)) if app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).is_service(&u.id).unwrap_or(false) => {
+                    let _ = sink.send(Message::Binary(codec::error(403, "", "Dienste nutzen die Lese-API, nicht den WebSocket").into())).await;
+                    let _ = sink.close().await;
+                    return;
+                }
                 Some((u, bound)) => {
                     let (device, hash) = (device.chars().take(64).collect::<String>(), sha256_hex(token.as_bytes()));
                     let _ = app.hub.store.lock().unwrap_or_else(|e| e.into_inner()).rename_token(&hash, &device);

@@ -719,6 +719,8 @@ details.hash code { display: block; margin-top: 4px; overflow-wrap: anywhere; fo
   padding: 14px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); word-break: break-all; user-select: all;
 }
 
+.code-big.token { font-size: 14px; letter-spacing: 0; text-align: left; padding: 10px; margin-bottom: 12px; }
+
 .drawer-btn, .drawer-close { display: none; }
 .drawer-backdrop { display: none; }
 .vault.no-tree .tree-pane, .vault.no-tree .drawer-btn, .vault.no-tree .drawer-backdrop { display: none; }

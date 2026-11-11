@@ -129,6 +129,19 @@ Ein Token ohne Vault (vor 0.6 ausgestellt oder per `token issue`) bindet sich be
 | DELETE | `/admin/api/devices/{deviceId}` | → 204 (Gerät endgültig entfernen, wird sofort getrennt) |
 | POST | `/admin/api/devices/cleanup` | `{revoked?: bool, inactiveDays?: n}` → `{removed}` (gesperrte und/oder seit n Tagen ungenutzte Geräte entfernen; gerade verbundene, nicht gesperrte bleiben) |
 
+### Schnittstellen (Dienste der Lese-API)
+
+Ein Dienst ist eine Person mit der Markierung `service`: Er hat in jedem Vault nur „Lesen“, darf nicht über den WebSocket verbinden (Fehler 403) und bekommt keine Einladungen. Seinen Token stellt der Admin direkt aus; er gilt für alle Vaults des Dienstes. In `GET /admin/api/users` erscheinen Dienste nicht, in Vault-Mitgliederlisten mit `service: true`.
+
+| Methode | Pfad | Body → Antwort |
+|---|---|---|
+| GET | `/admin/api/services` | → `[{id, name, color, spaces:[{id,name,role}], tokens:[{id, device, space, created, lastSeen, revoked}], feeds}]` (`feeds` = offene Änderungs-Feeds, `lastSeen` = letzter Zugriff) |
+| POST | `/admin/api/services` | `{id, name, spaces: [vault…]}` → `{id, token}` (Token nur in dieser Antwort) |
+| POST | `/admin/api/services/{id}/token` | → `{token}` (neuer Token, alle alten gesperrt; offene Feeds enden spätestens nach einer Minute) |
+| POST | `/admin/api/users/{id}/service` | → 204 (Person als Dienst übernehmen: Tokens bleiben gültig, Rollen werden „Lesen“, offene Einladungen verfallen) |
+
+Sperren, Entsperren, Löschen eines Tokens sowie Vault-Zugriff, Umbenennen und Löschen des Dienstes laufen über die Routen für Geräte, Personen und Mitglieder.
+
 ### Spaces (Vaults)
 
 | Methode | Pfad | Body → Antwort |
