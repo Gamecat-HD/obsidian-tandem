@@ -10,7 +10,7 @@
 		"build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production",
 		"test": "vitest run"
 	},
-	"license": "UNLICENSED",
+	"license": "AGPL-3.0-or-later",
 	"devDependencies": {
 		"@types/node": "^26.6.5",
 		"esbuild": "^0.28.2",

@@ -143,3 +143,7 @@ Die E2E-Tests starten isolierte, headless Obsidian-Instanzen (eigenes Profil, We
 ## Status
 
 Tandem ist im täglichen Einsatz (mehrere Personen, Desktop und Tablet) und ersetzt dort LiveSync. Das Plugin ist noch nicht im offiziellen Community-Katalog. Ende-zu-Ende-Verschlüsselung gibt es pro Vault ([E2EE.md](docs/E2EE.md)). In Klartext-Vaults sieht der Server die Inhalte, deshalb gehört er auf eigene Hardware.
+
+## Lizenz
+
+[AGPL-3.0-or-later](LICENSE): Plugin und Server dürfen frei genutzt, verändert und weitergegeben werden. Wer eine veränderte Fassung weitergibt oder den Server für andere übers Netz betreibt, muss den Quellcode dazu unter derselben Lizenz offenlegen.
