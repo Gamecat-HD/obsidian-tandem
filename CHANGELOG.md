@@ -1,5 +1,10 @@
 # Änderungen
 
+## 0.10.1
+
+- **Lizenz:** Tandem wird jetzt unter **AGPL-3.0-or-later** veröffentlicht; der vollständige Lizenztext steht in `LICENSE`. Keine funktionalen Änderungen gegenüber 0.10.0.
+- **Plugin und Server zusammen aktualisieren:** Beide tragen die Version 0.10.1, da Tandem nur identische Plugin-/Server-Versionen verbindet. Bestehende Vault-Daten und das Protokoll bleiben unverändert.
+
 ## 0.10.0
 
 Das Plugin ändert sich nur in der Versionsnummer. Es muss trotzdem aktualisiert werden, weil Plugin und Server dieselbe Version haben müssen.
