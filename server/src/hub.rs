@@ -8,7 +8,7 @@ use crate::db::{Store, User, now};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, warn};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
@@ -18,7 +18,6 @@ pub type ConnId = u64;
 
 pub enum Out {
     Frame(Vec<u8>),
-    Close,
 }
 
 pub struct Config {
@@ -50,6 +49,8 @@ struct Room {
 
 pub struct ConnInfo {
     tx: mpsc::Sender<Out>,
+    /// Schließsignal getrennt vom Kanal: geht auch durch, wenn der Kanal voll ist (Notify merkt es sich).
+    close: Arc<Notify>,
     pub user: User,
     pub device: String,
     /// sha256 des Geräte-Tokens (zum Trennen nach dem Sperren)
@@ -104,9 +105,11 @@ impl Hub {
         Arc::new(Self { store: Mutex::new(store), inner: Mutex::new(Inner::default()), changes_tx, closing, cfg, metrics: Default::default() })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         tx: mpsc::Sender<Out>,
+        close: Arc<Notify>,
         user: User,
         device: String,
         token: String,
@@ -116,7 +119,7 @@ impl Hub {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.next_id += 1;
         let id = g.next_id;
-        g.conns.insert(id, ConnInfo { tx, user, device, token, spaces, subs: HashSet::new(), stats });
+        g.conns.insert(id, ConnInfo { tx, close, user, device, token, spaces, subs: HashSet::new(), stats });
         id
     }
 
@@ -147,7 +150,7 @@ impl Hub {
         if let Some(c) = g.conns.get(&to) {
             if c.tx.try_send(Out::Frame(frame)).is_err() {
                 // Client kommt nicht hinterher (oder ist weg) → Verbindung schließen; er synchronisiert neu.
-                let _ = c.tx.try_send(Out::Close);
+                c.close.notify_one();
             }
         }
     }
@@ -656,7 +659,7 @@ impl Hub {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut n = 0;
         for c in g.conns.values().filter(|c| pred(c)) {
-            let _ = c.tx.try_send(Out::Close);
+            c.close.notify_one();
             n += 1;
         }
         n
@@ -686,7 +689,7 @@ impl Hub {
     pub fn kick_all(&self) {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for c in g.conns.values() {
-            let _ = c.tx.try_send(Out::Close);
+            c.close.notify_one();
         }
         info!("alle Verbindungen geschlossen");
     }
@@ -722,7 +725,7 @@ mod tests {
         };
         let (tx, _rx) = mpsc::channel(100);
         let spaces = HashMap::from([("sp".to_string(), "write".to_string()), ("zwei".to_string(), "write".to_string())]);
-        let c = h.register(tx, user(), "d".into(), token, spaces, Default::default());
+        let c = h.register(tx, Default::default(), user(), "d".into(), token, spaces, Default::default());
         let step1 = StateVector::default().encode_v1();
         assert!(!h.bind_conn(c, "fremd").unwrap(), "ohne Zugriff keine Bindung");
         h.on_sync(c, "zwei/x", codec::STEP1, &step1).unwrap();
@@ -739,7 +742,7 @@ mod tests {
         let h = hub();
         let (tx, mut rx) = mpsc::channel(100);
         let spaces = HashMap::from([("sp".to_string(), "write".to_string())]);
-        let c = h.register(tx, user(), "d".into(), "t".into(), spaces, Default::default());
+        let c = h.register(tx, Default::default(), user(), "d".into(), "t".into(), spaces, Default::default());
         h.on_sync(c, "sp/x", codec::STEP1, &StateVector::default().encode_v1()).unwrap();
 
         let client = Doc::new();
@@ -773,7 +776,7 @@ mod tests {
         assert_eq!(h.store.lock().unwrap_or_else(|e| e.into_inner()).update_count("sp/x").unwrap(), 1, "beim Entladen verdichtet");
         while rx.try_recv().is_ok() {}
         h.on_sync(c, "sp/x", codec::STEP1, &StateVector::default().encode_v1()).unwrap();
-        let Out::Frame(f) = rx.try_recv().unwrap() else { panic!() };
+        let Out::Frame(f) = rx.try_recv().unwrap();
         let mut r = codec::Reader::new(&f);
         assert_eq!(r.var_uint().unwrap(), codec::SYNC);
         r.string().unwrap();
@@ -789,7 +792,7 @@ mod tests {
     fn reader_cannot_write() {
         let h = hub();
         let (tx, _rx) = mpsc::channel(100);
-        let c = h.register(tx, user(), "d".into(), "t".into(), HashMap::from([("sp".to_string(), "read".to_string())]), Default::default());
+        let c = h.register(tx, Default::default(), user(), "d".into(), "t".into(), HashMap::from([("sp".to_string(), "read".to_string())]), Default::default());
         h.on_sync(c, "sp/x", codec::STEP1, &StateVector::default().encode_v1()).unwrap();
         let client = Doc::new();
         let t = client.get_or_insert_text("content");
@@ -833,8 +836,8 @@ mod tests {
         let spaces = HashMap::from([("enc".to_string(), "write".to_string())]);
         let (tx1, mut rx1) = mpsc::channel(100);
         let (tx2, mut rx2) = mpsc::channel(100);
-        let c1 = h.register(tx1, user(), "d1".into(), "t1".into(), spaces.clone(), Default::default());
-        let c2 = h.register(tx2, user(), "d2".into(), "t2".into(), spaces, Default::default());
+        let c1 = h.register(tx1, Default::default(), user(), "d1".into(), "t1".into(), spaces.clone(), Default::default());
+        let c2 = h.register(tx2, Default::default(), user(), "d2".into(), "t2".into(), spaces, Default::default());
 
         // Klartext-Yjs ist in verschlüsselten Spaces gesperrt, ebenso der Server-Lesezugriff
         assert!(matches!(h.on_sync(c1, "enc/x", codec::STEP1, &StateVector::default().encode_v1()), Err(HubError::E2ee)));
@@ -882,9 +885,22 @@ mod tests {
 
         // Lesende dürfen nichts anhängen
         let (tx3, _rx3) = mpsc::channel(100);
-        let c3 = h.register(tx3, user(), "d3".into(), "t3".into(), HashMap::from([("enc".to_string(), "read".to_string())]), Default::default());
+        let c3 = h.register(tx3, Default::default(), user(), "d3".into(), "t3".into(), HashMap::from([("enc".to_string(), "read".to_string())]), Default::default());
         assert!(matches!(h.on_eupd(c3, "enc/x", b"x"), Err(HubError::Forbidden)));
         // Verschlüsselung lässt sich bei Inhalt nicht mehr umschalten
         assert!(h.store.lock().unwrap().set_space_e2ee("enc", None).is_err());
+    }
+
+    #[test]
+    fn full_channel_still_closes() {
+        use futures_util::FutureExt;
+        let h = hub();
+        let (tx, _rx) = mpsc::channel(1);
+        let close = Arc::new(Notify::new());
+        let c = h.register(tx, close.clone(), user(), "d".into(), "t".into(), HashMap::new(), Default::default());
+        h.send_to(c, vec![1]);
+        assert!(close.notified().now_or_never().is_none(), "Platz im Kanal → offen lassen");
+        h.send_to(c, vec![2]); // Kanal voll
+        assert!(close.notified().now_or_never().is_some(), "Schließsignal darf nicht verloren gehen");
     }
 }

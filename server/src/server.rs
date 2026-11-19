@@ -163,9 +163,10 @@ async fn handle_socket(socket: WebSocket, app: App) {
     }
 
     let (tx, mut rx) = mpsc::channel::<Out>(2048);
+    let close = Arc::new(tokio::sync::Notify::new());
     let stats = Arc::new(crate::metrics::ConnStats::default());
     stats.connected_at.store(crate::db::now() as u64, Relaxed);
-    let id = app.hub.register(tx, user.clone(), device.clone(), token_hash, spaces, stats.clone());
+    let id = app.hub.register(tx, close.clone(), user.clone(), device.clone(), token_hash, spaces, stats.clone());
     // Zeitpunkt des letzten Pings (µs seit `epoch`) → Laufzeit beim Pong
     let epoch = Instant::now();
     let ping_at = Arc::new(AtomicU64::new(0));
@@ -173,19 +174,21 @@ async fn handle_socket(socket: WebSocket, app: App) {
 
     // 2. Schreiber: Frames + WS-Pings (hält Proxys wie Cloudflare wach; die Pong-Laufzeit ist die Latenz des Geräts)
     let writer = {
-        let (stats, ping_at, hub) = (stats.clone(), ping_at.clone(), app.hub.clone());
+        let (stats, ping_at, hub, close) = (stats.clone(), ping_at.clone(), app.hub.clone(), close.clone());
         tokio::spawn(async move {
             let mut ping = tokio::time::interval(Duration::from_secs(30));
             ping.reset_after(Duration::from_secs(2)); // erste Messung kurz nach dem Verbinden
             loop {
                 tokio::select! {
+                    biased; // Schließen vor dem Abarbeiten der restlichen Frames
+                    _ = close.notified() => { let _ = sink.close().await; break }
                     out = rx.recv() => match out {
                         Some(Out::Frame(f)) => {
                             stats.bytes_out.fetch_add(f.len() as u64, Relaxed);
                             hub.metrics.frame_out(f.len());
                             if sink.send(Message::Binary(f.into())).await.is_err() { break }
                         }
-                        Some(Out::Close) | None => { let _ = sink.close().await; break }
+                        None => { let _ = sink.close().await; break }
                     },
                     _ = ping.tick() => {
                         ping_at.store(epoch.elapsed().as_micros() as u64, Relaxed);
